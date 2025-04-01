@@ -2,7 +2,7 @@
 
 ![Production](https://img.shields.io/badge/status-production-brightgreen)
 ![Go Version](https://img.shields.io/badge/go-1.20+-blue)
-![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/tests.yml/badge.svg)
+![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/go.yml/badge.svg)
 ![Coverage](https://img.shields.io/codecov/c/github/your-org/your-repo)
 
 This repository demonstrates a **fully-featured Circuit Breaker** written in Go, along with a **simulated HTTP server** to test request handling under constraints such as:

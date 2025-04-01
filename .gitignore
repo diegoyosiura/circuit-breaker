@@ -1,0 +1,42 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Output folders
+bin/
+obj/
+
+# Go build cache
+*.out
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage.out
+
+# Logs
+*.log
+
+# Dependency directories
+vendor/
+
+# Test output
+*.tmp
+
+# Go modules (optional)
+/go.sum
+
+# Environment files
+.env
+.env.*

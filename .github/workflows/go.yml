@@ -25,7 +25,10 @@ jobs:
       run: go mod tidy
 
     - name: Run tests with coverage
-      run: go test ./... -coverprofile=coverage.out -covermode=atomic
+      run: |
+        go test -race -count=1 -coverprofile=coverage.out ./...
+        go tool cover -func=coverage.out | awk '/^total:/ {print "coverage: " $3}'
+        go tool cover -html=coverage.out -o coverage.htm
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3

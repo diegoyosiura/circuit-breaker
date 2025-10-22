@@ -19,7 +19,6 @@ import (
 type CircuitBreaker struct {
 	Name          string        // Circuit identifier
 	MaxConcurrent int           // Maximum concurrent requests allowed
-	Client        *http.Client  // Underlying HTTP client used to execute requests
 	MaxRetries    int           // Number of retry attempts allowed for retryable failures
 	sem           chan struct{} // Semaphore to control concurrent request slots
 	tokens        chan struct{} // Token bucket channel to regulate request rate
@@ -41,7 +40,6 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 		Name:          name,
 		MaxConcurrent: maxConcurrent,
 		MaxRetries:    maxRetries,
-		Client:        &http.Client{Timeout: 10 * time.Second}, // Default timeout
 	}
 
 	if maxConcurrent > 0 {
@@ -99,7 +97,7 @@ func (cb *CircuitBreaker) startTokenBucket() {
 // - Concurrency and rate limits are respected
 // - Retry logic is applied on retryable errors
 // - Context cancellation or timeout is observed
-func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) {
+func (cb *CircuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
 	if cb.sem != nil {
 		// Wait for a concurrency slot or return if context is cancelled
 		select {
@@ -119,7 +117,7 @@ func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) {
 		newReq := req.Clone(req.Context())
 
 		// Attempt the request
-		resp, err := cb.Client.Do(newReq)
+		resp, err := cl.Do(newReq)
 		if err == nil {
 			return resp, nil // Success
 		}

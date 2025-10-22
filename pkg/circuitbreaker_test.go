@@ -34,14 +34,14 @@ func TestCircuitBreaker_BasicRequest(t *testing.T) {
 
 	cb := circuitbreaker.NewCircuitBreaker("test", 2, 4, 1, 0)
 	t.Cleanup(cb.Stop)
-	cb.Client = server.Client()
+	cl := server.Client()
 
 	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	resp, err := cb.Do(req)
+	resp, err := cb.Do(req, cl)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -58,7 +58,7 @@ func TestCircuitBreaker_RetryOnTemporaryError(t *testing.T) {
 
 	var attempts int32
 	const failCount = 2
-	cb.Client = &http.Client{
+	cl := &http.Client{
 		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			if atomic.AddInt32(&attempts, 1) <= failCount {
 				return nil, temporaryError{}
@@ -79,7 +79,7 @@ func TestCircuitBreaker_RetryOnTemporaryError(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	resp, err := cb.Do(req)
+	resp, err := cb.Do(req, cl)
 	if err != nil {
 		t.Fatalf("expected request to succeed after retries, got %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCircuitBreaker_ContextCancellationWhileWaitingForToken(t *testing.T) {
 	cb := circuitbreaker.NewCircuitBreaker("ctx", 1, 1, 10, 0)
 	t.Cleanup(cb.Stop)
 
-	cb.Client = &http.Client{
+	cl := &http.Client{
 		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -111,7 +111,7 @@ func TestCircuitBreaker_ContextCancellationWhileWaitingForToken(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	resp, err := cb.Do(baseReq)
+	resp, err := cb.Do(baseReq, cl)
 	if err != nil {
 		t.Fatalf("expected initial request to succeed, got %v", err)
 	}
@@ -121,7 +121,7 @@ func TestCircuitBreaker_ContextCancellationWhileWaitingForToken(t *testing.T) {
 	defer cancel()
 
 	reqWithTimeout := baseReq.Clone(ctx)
-	_, err = cb.Do(reqWithTimeout)
+	_, err = cb.Do(reqWithTimeout, cl)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded error, got %v", err)
 	}

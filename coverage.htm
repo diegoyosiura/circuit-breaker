@@ -57,7 +57,7 @@
 				
 				<option value="file0">circuit-breaker/cmd/main.go (0.0%)</option>
 				
-				<option value="file1">circuit-breaker/internal/fakeserver.go (92.1%)</option>
+				<option value="file1">circuit-breaker/internal/fakeserver.go (100.0%)</option>
 				
 				<option value="file2">circuit-breaker/pkg/circuitbreaker.go (76.2%)</option>
 				
@@ -84,7 +84,9 @@
 		</div>
 		<div id="content">
 		
-		<pre class="file" id="file0" style="display: none">package main
+		<pre class="file" id="file0" style="display: none">//go:build !unittest
+
+package main
 
 import (
         "circuit-breaker/internal"
@@ -134,9 +136,9 @@ func main() <span class="cov0" title="0">{
 
                         // Create a new HTTP GET request to the test endpoint
                         req, _ := http.NewRequest("GET", "http://localhost:8080/teste", nil)
-
+                        cl := &amp;http.Client{Timeout: 10 * time.Second}
                         // Execute the request through the CircuitBreaker
-                        resp, err := cb.Do(req)
+                        resp, err := cb.Do(req, cl)
 
                         // Print result or error
                         if err != nil </span><span class="cov0" title="0">{
@@ -252,7 +254,7 @@ func (f *FakeServer) handle(w http.ResponseWriter, r *http.Request) <span class=
 // It checks whether the current RPS exceeds the maximum recorded,
 // and resets the per-second request counter.
 func (f *FakeServer) reset() <span class="cov1" title="1">{
-        for </span><span class="cov10" title="4">{
+        for </span><span class="cov10" title="6">{
                 time.Sleep(1 * time.Second)
                 f.mu.Lock()
 
@@ -262,7 +264,7 @@ func (f *FakeServer) reset() <span class="cov1" title="1">{
                 }</span>
 
                 // Reset current second counter
-                <span class="cov8" title="3">f.requestsPerSecond = 0
+                <span class="cov9" title="5">f.requestsPerSecond = 0
                 f.mu.Unlock()</span>
         }
 }
@@ -273,19 +275,19 @@ func (f *FakeServer) reset() <span class="cov1" title="1">{
 // - Maximum requests per second recorded
 // - Average requests per second since server start
 func (f *FakeServer) stats() <span class="cov1" title="1">{
-        for </span><span class="cov1" title="1">{
+        for </span><span class="cov4" title="2">{
                 time.Sleep(5 * time.Second)
                 f.mu.Lock()
 
                 // Calculate average RPS since startup
                 elapsed := time.Since(f.startTime).Seconds()
                 var avg float64
-                if elapsed &gt; 0 </span><span class="cov0" title="0">{
+                if elapsed &gt; 0 </span><span class="cov1" title="1">{
                         avg = float64(f.totalRequests) / elapsed
                 }</span>
 
                 // Print collected statistics
-                <span class="cov0" title="0">fmt.Printf("📊 Máx. simultâneas: %d | Máx. req/s: %d | Média req/s: %.2f\n",
+                <span class="cov1" title="1">fmt.Printf("📊 Máx. simultâneas: %d | Máx. req/s: %d | Média req/s: %.2f\n",
                         f.maxSimultaneous, f.maxRequestsPerSecond, avg)
 
                 f.mu.Unlock()</span>
@@ -321,7 +323,6 @@ import (
 type CircuitBreaker struct {
         Name          string        // Circuit identifier
         MaxConcurrent int           // Maximum concurrent requests allowed
-        Client        *http.Client  // Underlying HTTP client used to execute requests
         MaxRetries    int           // Number of retry attempts allowed for retryable failures
         sem           chan struct{} // Semaphore to control concurrent request slots
         tokens        chan struct{} // Token bucket channel to regulate request rate
@@ -343,7 +344,6 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
                 Name:          name,
                 MaxConcurrent: maxConcurrent,
                 MaxRetries:    maxRetries,
-                Client:        &amp;http.Client{Timeout: 10 * time.Second}, // Default timeout
         }
 
         if maxConcurrent &gt; 0 </span><span class="cov3" title="4">{
@@ -388,8 +388,8 @@ func (cb *CircuitBreaker) startTokenBucket() <span class="cov3" title="4">{
                                 return</span> // Stop signal received
                         case &lt;-ticker.C:<span class="cov5" title="10">
                                 select </span>{
-                                case cb.tokens &lt;- struct{}{}:<span class="cov3" title="3"></span>
-                                default:<span class="cov5" title="7"></span>
+                                case cb.tokens &lt;- struct{}{}:<span class="cov2" title="2"></span>
+                                default:<span class="cov5" title="8"></span>
                                         // Token bucket is full; drop the token (non-blocking)
                                 }
                         }
@@ -401,7 +401,7 @@ func (cb *CircuitBreaker) startTokenBucket() <span class="cov3" title="4">{
 // - Concurrency and rate limits are respected
 // - Retry logic is applied on retryable errors
 // - Context cancellation or timeout is observed
-func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) <span class="cov3" title="4">{
+func (cb *CircuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) <span class="cov3" title="4">{
         if cb.sem != nil </span><span class="cov3" title="4">{
                 // Wait for a concurrency slot or return if context is cancelled
                 select </span>{
@@ -421,7 +421,7 @@ func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) <span cl
                 <span class="cov4" title="5">newReq := req.Clone(req.Context())
 
                 // Attempt the request
-                resp, err := cb.Client.Do(newReq)
+                resp, err := cl.Do(newReq)
                 if err == nil </span><span class="cov3" title="3">{
                         return resp, nil // Success
                 }</span>

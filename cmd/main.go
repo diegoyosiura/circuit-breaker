@@ -50,9 +50,9 @@ func main() {
 
 			// Create a new HTTP GET request to the test endpoint
 			req, _ := http.NewRequest("GET", "http://localhost:8080/teste", nil)
-
+			cl := &http.Client{Timeout: 10 * time.Second}
 			// Execute the request through the CircuitBreaker
-			resp, err := cb.Do(req)
+			resp, err := cb.Do(req, cl)
 
 			// Print result or error
 			if err != nil {

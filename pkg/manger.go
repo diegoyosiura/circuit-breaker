@@ -10,16 +10,16 @@ import "sync"
 // - Centralized lifecycle management
 // - Thread-safe access to named CircuitBreakers
 // - Avoidance of redundant instantiations
-type Manager struct {
+type manager struct {
 	mu sync.RWMutex
-	cb map[string]*CircuitBreaker
+	cb map[string]ICircuitBreaker
 }
 
 // NewManager initializes and returns a new Manager instance.
 // It prepares an empty map and a mutex for thread-safe management.
-func NewManager() *Manager {
-	return &Manager{
-		cb: make(map[string]*CircuitBreaker),
+func NewManager() IManager {
+	return &manager{
+		cb: make(map[string]ICircuitBreaker),
 	}
 }
 
@@ -35,12 +35,12 @@ func NewManager() *Manager {
 //
 // Returns:
 // - A pointer to the existing or newly created CircuitBreaker instance
-func (m *Manager) NewCircuitBreaker(
+func (m *manager) NewCircuitBreaker(
 	name string,
 	maxConcurrent, maxRequests int,
 	windowSeconds int,
 	maxRetries int,
-) *CircuitBreaker {
+) ICircuitBreaker {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -58,7 +58,7 @@ func (m *Manager) NewCircuitBreaker(
 // Returns:
 // - The CircuitBreaker pointer if it exists
 // - nil if no CircuitBreaker with the given name was found
-func (m *Manager) GetCircuitBreaker(name string) *CircuitBreaker {
+func (m *manager) GetCircuitBreaker(name string) ICircuitBreaker {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

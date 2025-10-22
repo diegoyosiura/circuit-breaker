@@ -11,12 +11,12 @@ import (
 	"time"
 )
 
-// CircuitBreaker implements a resilient HTTP request handler with the following features:
+// circuitBreaker implements a resilient HTTP request handler with the following features:
 // - Maximum number of concurrent requests
 // - Rate-limiting using a token bucket algorithm
 // - Automatic retries for transient network failures
 // - Context-aware cancellation and timeout support
-type CircuitBreaker struct {
+type circuitBreaker struct {
 	Name          string        // Circuit identifier
 	MaxConcurrent int           // Maximum concurrent requests allowed
 	MaxRetries    int           // Number of retry attempts allowed for retryable failures
@@ -29,14 +29,14 @@ type CircuitBreaker struct {
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 }
 
-// NewCircuitBreaker initializes a new CircuitBreaker instance with concurrency, rate, and retry controls.
+// NewCircuitBreaker initializes a new ICircuitBreaker instance with concurrency, rate, and retry controls.
 // - name: Identifier for this circuit
 // - maxConcurrent: Max number of simultaneous requests
 // - maxRequests: Max number of requests per time window
 // - windowSeconds: Duration of the rate-limiting window
 // - maxRetries: Max number of retry attempts on failure
-func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSeconds int, maxRetries int) *CircuitBreaker {
-	cb := &CircuitBreaker{
+func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSeconds int, maxRetries int) ICircuitBreaker {
+	cb := &circuitBreaker{
 		Name:          name,
 		MaxConcurrent: maxConcurrent,
 		MaxRetries:    maxRetries,
@@ -67,7 +67,7 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 
 // startTokenBucket starts a background goroutine that generates tokens at regular intervals
 // to enforce the request rate limit using a token bucket mechanism.
-func (cb *CircuitBreaker) startTokenBucket() {
+func (cb *circuitBreaker) startTokenBucket() {
 	if cb.tokens == nil || cb.tokenStop == nil || cb.tokenInterval <= 0 {
 		return
 	}
@@ -97,7 +97,7 @@ func (cb *CircuitBreaker) startTokenBucket() {
 // - Concurrency and rate limits are respected
 // - Retry logic is applied on retryable errors
 // - Context cancellation or timeout is observed
-func (cb *CircuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
+func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
 	if cb.sem != nil {
 		// Wait for a concurrency slot or return if context is cancelled
 		select {
@@ -139,7 +139,7 @@ func (cb *CircuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 
 // Stop gracefully shuts down the token bucket goroutine.
 // Should be called when the circuit is no longer needed.
-func (cb *CircuitBreaker) Stop() {
+func (cb *circuitBreaker) Stop() {
 	if cb.tokenStop == nil {
 		return
 	}
@@ -150,7 +150,7 @@ func (cb *CircuitBreaker) Stop() {
 	cb.tokenWaitGroup.Wait()
 }
 
-func (cb *CircuitBreaker) waitForToken(ctx context.Context) error {
+func (cb *circuitBreaker) waitForToken(ctx context.Context) error {
 	if cb.tokens == nil {
 		return nil
 	}

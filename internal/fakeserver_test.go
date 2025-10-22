@@ -1,7 +1,7 @@
 package internal_test
 
 import (
-	"circuit-breaker/internal"
+	"github.com/diegoyosiura/circuit-breaker/internal"
 	"net/http"
 	"testing"
 	"time"

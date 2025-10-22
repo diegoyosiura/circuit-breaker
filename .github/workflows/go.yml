@@ -29,7 +29,7 @@ jobs:
         PKGS=$(go list ./... | grep -v '/cmd')
         go test -race -count=1 -coverpkg="$(printf '%s' "$PKGS" | tr '\n' ',')" -coverprofile=coverage.out ./...
         go tool cover -func=coverage.out | awk '/^total:/ {print "coverage: " $3}'
-        go tool cover -html=coverage.out -o coverage.htm
+        go tool cover -html=coverage.out -o coverage.html
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3

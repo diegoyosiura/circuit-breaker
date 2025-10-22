@@ -1,7 +1,7 @@
 package circuitbreaker_test
 
 import (
-	"circuit-breaker/pkg"
+	"github.com/diegoyosiura/circuit-breaker/pkg"
 	"testing"
 )
 

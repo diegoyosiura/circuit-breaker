@@ -3,9 +3,11 @@
 package main
 
 import (
-	"circuit-breaker/internal"
-	circuitbreaker "circuit-breaker/pkg"
 	"fmt"
+
+	"github.com/diegoyosiura/circuit-breaker/internal"
+	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
+
 	"net/http"
 	"sync"
 	"time"

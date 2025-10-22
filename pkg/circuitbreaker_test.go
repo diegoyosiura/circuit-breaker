@@ -1,9 +1,9 @@
 package circuitbreaker_test
 
 import (
-	circuitbreaker "circuit-breaker/pkg"
 	"context"
 	"errors"
+	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
 	"io"
 	"net/http"
 	"net/http/httptest"

@@ -1,6 +1,7 @@
 package circuitbreaker
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -16,15 +17,17 @@ import (
 // - Automatic retries for transient network failures
 // - Context-aware cancellation and timeout support
 type CircuitBreaker struct {
-	Name           string         // Circuit identifier
-	MaxConcurrent  int            // Maximum concurrent requests allowed
-	Client         *http.Client   // Underlying HTTP client used to execute requests
-	MaxRetries     int            // Number of retry attempts allowed for retryable failures
-	sem            chan struct{}  // Semaphore to control concurrent request slots
-	tokens         chan struct{}  // Token bucket channel to regulate request rate
-	tokenInterval  time.Duration  // Interval between tokens being added to the bucket
-	tokenStop      chan struct{}  // Channel to signal shutdown of the token generator
+	Name          string        // Circuit identifier
+	MaxConcurrent int           // Maximum concurrent requests allowed
+	Client        *http.Client  // Underlying HTTP client used to execute requests
+	MaxRetries    int           // Number of retry attempts allowed for retryable failures
+	sem           chan struct{} // Semaphore to control concurrent request slots
+	tokens        chan struct{} // Token bucket channel to regulate request rate
+	tokenInterval time.Duration // Interval between tokens being added to the bucket
+	tokenStop     chan struct{} // Channel to signal shutdown of the token generator
+
 	tokenWaitGroup sync.WaitGroup // WaitGroup to ensure graceful token goroutine shutdown
+	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 }
 
 // NewCircuitBreaker initializes a new CircuitBreaker instance with concurrency, rate, and retry controls.
@@ -38,19 +41,39 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 		Name:          name,
 		MaxConcurrent: maxConcurrent,
 		MaxRetries:    maxRetries,
-		Client:        &http.Client{Timeout: 10 * time.Second},                             // Default timeout
-		sem:           make(chan struct{}, maxConcurrent),                                  // Controls concurrent execution
-		tokens:        make(chan struct{}, maxRequests),                                    // Token bucket capacity
-		tokenInterval: time.Duration(windowSeconds*1e9/int(maxRequests)) * time.Nanosecond, // Token generation rate
-		tokenStop:     make(chan struct{}),
+		Client:        &http.Client{Timeout: 10 * time.Second}, // Default timeout
 	}
-	cb.startTokenBucket()
+
+	if maxConcurrent > 0 {
+		cb.sem = make(chan struct{}, maxConcurrent)
+	}
+
+	if maxRequests > 0 && windowSeconds > 0 {
+		cb.tokens = make(chan struct{}, maxRequests)
+		interval := (time.Duration(windowSeconds) * time.Second) / time.Duration(maxRequests)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		cb.tokenInterval = interval
+		cb.tokenStop = make(chan struct{})
+
+		for i := 0; i < cap(cb.tokens); i++ {
+			cb.tokens <- struct{}{}
+		}
+
+		cb.startTokenBucket()
+	}
+
 	return cb
 }
 
 // startTokenBucket starts a background goroutine that generates tokens at regular intervals
 // to enforce the request rate limit using a token bucket mechanism.
 func (cb *CircuitBreaker) startTokenBucket() {
+	if cb.tokens == nil || cb.tokenStop == nil || cb.tokenInterval <= 0 {
+		return
+	}
+
 	cb.tokenWaitGroup.Add(1)
 	go func() {
 		defer cb.tokenWaitGroup.Done()
@@ -77,20 +100,19 @@ func (cb *CircuitBreaker) startTokenBucket() {
 // - Retry logic is applied on retryable errors
 // - Context cancellation or timeout is observed
 func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) {
-	// Wait for a concurrency slot or return if context is cancelled
-	select {
-	case cb.sem <- struct{}{}:
-	case <-req.Context().Done():
-		return nil, req.Context().Err()
-	}
-	defer func() { <-cb.sem }() // Release concurrency slot
-
-	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
-		// Wait for a token to proceed or abort on context cancellation
+	if cb.sem != nil {
+		// Wait for a concurrency slot or return if context is cancelled
 		select {
-		case <-cb.tokens:
+		case cb.sem <- struct{}{}:
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
+		}
+		defer func() { <-cb.sem }() // Release concurrency slot
+	}
+
+	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
+		if err := cb.waitForToken(req.Context()); err != nil {
+			return nil, err
 		}
 
 		// Clone the request to avoid reuse issues with Body on retries
@@ -120,8 +142,27 @@ func (cb *CircuitBreaker) Do(req *http.Request) (*http.Response, error) {
 // Stop gracefully shuts down the token bucket goroutine.
 // Should be called when the circuit is no longer needed.
 func (cb *CircuitBreaker) Stop() {
-	close(cb.tokenStop)
+	if cb.tokenStop == nil {
+		return
+	}
+
+	cb.stopOnce.Do(func() {
+		close(cb.tokenStop)
+	})
 	cb.tokenWaitGroup.Wait()
+}
+
+func (cb *CircuitBreaker) waitForToken(ctx context.Context) error {
+	if cb.tokens == nil {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-cb.tokens:
+		return nil
+	}
 }
 
 // isRetryable checks if an error is considered transient/retryable,

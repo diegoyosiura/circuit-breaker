@@ -1,8 +1,6 @@
 package circuitbreaker
 
-import (
-	"sync"
-)
+import "sync"
 
 // Manager is responsible for managing multiple CircuitBreaker instances.
 // It acts as a centralized registry, ensuring that each named CircuitBreaker
@@ -13,15 +11,14 @@ import (
 // - Thread-safe access to named CircuitBreakers
 // - Avoidance of redundant instantiations
 type Manager struct {
-	mu *sync.Mutex                // Mutex to protect concurrent access to the map
-	cb map[string]*CircuitBreaker // Map to store CircuitBreakers by name
+	mu sync.RWMutex
+	cb map[string]*CircuitBreaker
 }
 
 // NewManager initializes and returns a new Manager instance.
 // It prepares an empty map and a mutex for thread-safe management.
 func NewManager() *Manager {
 	return &Manager{
-		mu: &sync.Mutex{},
 		cb: make(map[string]*CircuitBreaker),
 	}
 }
@@ -44,14 +41,16 @@ func (m *Manager) NewCircuitBreaker(
 	windowSeconds int,
 	maxRetries int,
 ) *CircuitBreaker {
-	m.mu.Lock()         // Lock access to the map to ensure thread safety
-	defer m.mu.Unlock() // Always unlock after operation
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	// If the circuit doesn't exist yet, create and store it
-	if _, ok := m.cb[name]; !ok {
-		m.cb[name] = NewCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
+	if cb, ok := m.cb[name]; ok {
+		return cb
 	}
-	return m.cb[name]
+
+	cb := NewCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
+	m.cb[name] = cb
+	return cb
 }
 
 // GetCircuitBreaker retrieves a CircuitBreaker by name from the manager.
@@ -60,12 +59,11 @@ func (m *Manager) NewCircuitBreaker(
 // - The CircuitBreaker pointer if it exists
 // - nil if no CircuitBreaker with the given name was found
 func (m *Manager) GetCircuitBreaker(name string) *CircuitBreaker {
-	m.mu.Lock()         // Ensure thread-safe read
-	defer m.mu.Unlock() // Release lock after access
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	// Lookup the circuit by name
-	if _, ok := m.cb[name]; !ok {
-		return nil
+	if cb, ok := m.cb[name]; ok {
+		return cb
 	}
-	return m.cb[name]
+	return nil
 }

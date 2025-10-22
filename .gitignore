@@ -1,42 +1,118 @@
-# Binaries
+# Go build cache e artefatos
+bin/
+build/
+dist/
+out/
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
 *.test
+*.cover
+coverage*.out
+coverage*.html
 
-# Output folders
-bin/
-obj/
+# Módulos Go
+vendor/
+go.work
+go.work.sum
 
-# Go build cache
-*.out
+# Logs e dumps
+*.log
+*.trace
+*.pprof
+*.prof
+*.stackdump
+*.core
+core
+*.crash
 
-# IDEs and editors
-.idea/
-.vscode/
+# Arquivos temporários comuns
+*.tmp
+*.temp
 *.swp
-
-# OS files
-.DS_Store
+*.swo
+*.DS_Store
 Thumbs.db
 
-# Coverage
-coverage.out
+# IDEs e editores
+# JetBrains
+.idea/
+*.iml
+# VS Code
+.vscode/
+.history/
+# Fleet
+.fleet/
+# Sublime
+*.sublime-workspace
+*.sublime-project
+# Eclipse
+.project
+.metadata/
+# Vim
+*.vim
+# Emacs
+*~
+\#*\#
+.\#*
 
-# Logs
-*.log
+# Containers e CI locais
+.docker/
+docker-compose.override.yml
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# Dependency directories
-vendor/
-
-# Test output
-*.tmp
-
-# Go modules (optional)
-/go.sum
-
-# Environment files
+# Segurança: nunca versionar segredos, chaves e certs
 .env
 .env.*
+*.env
+*.key
+*.pem
+*.crt
+*.cer
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.kdb
+*.asc
+*.gpg
+*.age
+secret
+secrets
+secrets.*
+*.secret
+*.secrets.*
+*.vault
+*.tfstate
+*.tfstate.*
+.terraform/
+*.bak
+*.old
+*.orig
+
+# Configs sensíveis comuns
+npmrc
+.npmrc
+.pypirc
+.netrc
+.aws/
+.azure/
+.gcloud/
+.kube/
+.oci/
+ssh_config
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+known_hosts
+
+# Arquivos de exemplo seguros podem ser versionados
+!.env.example
+
+export_ia.sh
+repo_dump.txt

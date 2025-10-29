@@ -27,6 +27,9 @@ type circuitBreaker struct {
 
 	tokenWaitGroup sync.WaitGroup // WaitGroup to ensure graceful token goroutine shutdown
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
+
+	metricsMu sync.RWMutex
+	metrics   map[string]map[string]*EndpointMetrics
 }
 
 // NewCircuitBreaker initializes a new ICircuitBreaker instance with concurrency, rate, and retry controls.
@@ -108,20 +111,30 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		defer func() { <-cb.sem }() // Release concurrency slot
 	}
 
+	host := req.URL.Host
+	endpoint := req.URL.Path
+	if endpoint == "" {
+		endpoint = "/"
+	}
+
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
 		if err := cb.waitForToken(req.Context()); err != nil {
+			cb.recordFailure(host, endpoint)
 			return nil, err
 		}
 
+		cb.recordAttempt(host, endpoint)
 		// Clone the request to avoid reuse issues with Body on retries
 		newReq := req.Clone(req.Context())
 
 		// Attempt the request
 		resp, err := cl.Do(newReq)
 		if err == nil {
+			cb.recordSuccess(host, endpoint)
 			return resp, nil // Success
 		}
 
+		cb.recordFailure(host, endpoint)
 		// Return immediately if the error is not retryable
 		if !isRetryable(err) {
 			return nil, err
@@ -129,6 +142,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 
 		// If retries remain, back off slightly before trying again
 		if attempt < cb.MaxRetries {
+			cb.recordRetry(host, endpoint)
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
@@ -185,4 +199,68 @@ func isRetryable(err error) bool {
 	}
 
 	return false
+}
+
+// Metrics returns a snapshot of the aggregated metrics per host and endpoint.
+func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
+	cb.metricsMu.RLock()
+	defer cb.metricsMu.RUnlock()
+
+	result := make(map[string]map[string]EndpointMetrics, len(cb.metrics))
+	for host, endpoints := range cb.metrics {
+		endpointCopy := make(map[string]EndpointMetrics, len(endpoints))
+		for endpoint, metrics := range endpoints {
+			endpointCopy[endpoint] = *metrics
+		}
+		result[host] = endpointCopy
+	}
+
+	return result
+}
+
+func (cb *circuitBreaker) recordAttempt(host, endpoint string) {
+	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
+		m.TotalRequests++
+	})
+}
+
+func (cb *circuitBreaker) recordSuccess(host, endpoint string) {
+	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
+		m.SuccessfulRequests++
+	})
+}
+
+func (cb *circuitBreaker) recordFailure(host, endpoint string) {
+	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
+		m.FailedRequests++
+	})
+}
+
+func (cb *circuitBreaker) recordRetry(host, endpoint string) {
+	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
+		m.RetryCount++
+	})
+}
+
+func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*EndpointMetrics)) {
+	cb.metricsMu.Lock()
+	defer cb.metricsMu.Unlock()
+
+	if cb.metrics == nil {
+		cb.metrics = make(map[string]map[string]*EndpointMetrics)
+	}
+
+	hostMetrics, ok := cb.metrics[host]
+	if !ok {
+		hostMetrics = make(map[string]*EndpointMetrics)
+		cb.metrics[host] = hostMetrics
+	}
+
+	endpointMetrics, ok := hostMetrics[endpoint]
+	if !ok {
+		endpointMetrics = &EndpointMetrics{}
+		hostMetrics[endpoint] = endpointMetrics
+	}
+
+	updateFn(endpointMetrics)
 }

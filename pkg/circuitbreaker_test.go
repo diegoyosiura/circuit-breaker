@@ -3,7 +3,6 @@ package circuitbreaker_test
 import (
 	"context"
 	"errors"
-	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -124,5 +125,65 @@ func TestCircuitBreaker_ContextCancellationWhileWaitingForToken(t *testing.T) {
 	_, err = cb.Do(reqWithTimeout, cl)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline exceeded error, got %v", err)
+	}
+}
+func TestCircuitBreaker_Metrics(t *testing.T) {
+	cb := circuitbreaker.NewCircuitBreaker("metrics", 1, 10, 1, 2)
+	t.Cleanup(cb.Stop)
+
+	var attempts int32
+	cl := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			current := atomic.AddInt32(&attempts, 1)
+			if current == 1 {
+				return nil, temporaryError{}
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}),
+		Timeout: time.Second,
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.com/test", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := cb.Do(req, cl)
+	if err != nil {
+		t.Fatalf("expected request to succeed, got %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	metrics := cb.Metrics()
+	hostMetrics, ok := metrics["example.com"]
+	if !ok {
+		t.Fatalf("expected metrics for host example.com, got %v", metrics)
+	}
+
+	endpointMetrics, ok := hostMetrics["/test"]
+	if !ok {
+		t.Fatalf("expected metrics for endpoint /test, got %v", hostMetrics)
+	}
+
+	if endpointMetrics.TotalRequests != 2 {
+		t.Fatalf("expected 2 total requests, got %d", endpointMetrics.TotalRequests)
+	}
+
+	if endpointMetrics.SuccessfulRequests != 1 {
+		t.Fatalf("expected 1 successful request, got %d", endpointMetrics.SuccessfulRequests)
+	}
+
+	if endpointMetrics.FailedRequests != 1 {
+		t.Fatalf("expected 1 failed request, got %d", endpointMetrics.FailedRequests)
+	}
+
+	if endpointMetrics.RetryCount != 1 {
+		t.Fatalf("expected 1 retry, got %d", endpointMetrics.RetryCount)
 	}
 }

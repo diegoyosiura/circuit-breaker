@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -223,7 +224,12 @@ func (cb *circuitBreaker) recordAttempt(host, endpoint string, start, end time.T
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.TotalRequests++
 		m.TimeRequests = append(m.TimeRequests, end.Sub(start).Seconds())
+		m.StartTimeRequests = append(m.StartTimeRequests, start)
 		m.MeanRequests, _ = avgLastNItens(m.TimeRequests, 20)
+
+		m.Ratio01Requests = repsRatio(m.StartTimeRequests, 1)
+		m.Ratio05Requests = repsRatio(m.StartTimeRequests, 5)
+		m.Ratio10Requests = repsRatio(m.StartTimeRequests, 10)
 	})
 }
 
@@ -231,7 +237,12 @@ func (cb *circuitBreaker) recordSuccess(host, endpoint string, start, end time.T
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.SuccessfulRequests++
 		m.TimeSuccessfulRequests = append(m.TimeSuccessfulRequests, end.Sub(start).Seconds())
+		m.StartTimeSuccessfulRequests = append(m.StartTimeSuccessfulRequests, start)
 		m.MeanSuccessfulRequests, _ = avgLastNItens(m.TimeSuccessfulRequests, 20)
+
+		m.Ratio01SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 1)
+		m.Ratio05SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 5)
+		m.Ratio10SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 10)
 	})
 }
 
@@ -239,7 +250,12 @@ func (cb *circuitBreaker) recordFailure(host, endpoint string, start, end time.T
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.FailedRequests++
 		m.TimeFailedRequests = append(m.TimeFailedRequests, end.Sub(start).Seconds())
+		m.StartTimeFailedRequests = append(m.StartTimeFailedRequests, start)
 		m.MeanFailedRequests, _ = avgLastNItens(m.TimeFailedRequests, 20)
+
+		m.Ratio01FailedRequests = repsRatio(m.StartTimeFailedRequests, 1)
+		m.Ratio05FailedRequests = repsRatio(m.StartTimeFailedRequests, 5)
+		m.Ratio10FailedRequests = repsRatio(m.StartTimeFailedRequests, 10)
 	})
 }
 
@@ -247,7 +263,12 @@ func (cb *circuitBreaker) recordRetry(host, endpoint string, start, end time.Tim
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.RetryCount++
 		m.TimeRetry = append(m.TimeRetry, end.Sub(start).Seconds())
+		m.StartTimeRetry = append(m.StartTimeRetry, start)
 		m.MeanRetry, _ = avgLastNItens(m.TimeRetry, 20)
+
+		m.Ratio01Retry = repsRatio(m.StartTimeRetry, 1)
+		m.Ratio05Retry = repsRatio(m.StartTimeRetry, 5)
+		m.Ratio10Retry = repsRatio(m.StartTimeRetry, 10)
 	})
 }
 
@@ -263,6 +284,7 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*En
 	if !ok {
 		hostMetrics = make(map[string]*EndpointMetrics)
 		cb.metrics[host] = hostMetrics
+		cb.metrics[host]["::root"] = &EndpointMetrics{}
 	}
 
 	endpointMetrics, ok := hostMetrics[endpoint]
@@ -272,6 +294,7 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*En
 	}
 
 	updateFn(endpointMetrics)
+	updateFn(cb.metrics[host]["::root"])
 }
 
 func avgLastNItens(xs []float64, size int) (avg float64, count int) {
@@ -288,4 +311,33 @@ func avgLastNItens(xs []float64, size int) (avg float64, count int) {
 	}
 	count = len(xs) - start
 	return sum / float64(count), count
+}
+
+func repsRatio(ts []time.Time, windowMinutes int) (avg int64) {
+	if len(ts) == 0 || windowMinutes <= 0 {
+		return 0
+	}
+
+	slices.SortFunc(ts, func(a, b time.Time) int {
+		switch {
+		case a.After(b):
+			return -1 // a vem antes de b (mais recente primeiro)
+		case a.Before(b):
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	cutoff := time.Now().Add(-time.Duration(windowMinutes) * time.Minute)
+	count := 0
+	// Percorre de trás para frente e para quando sair da janela ou atingir n.
+	for _, t := range ts {
+		if t.After(cutoff) || t.Equal(cutoff) {
+			count++
+		} else {
+			break
+		}
+	}
+	return int64(count)
 }

@@ -118,23 +118,24 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 	}
 
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
+		start := time.Now()
 		if err := cb.waitForToken(req.Context()); err != nil {
-			cb.recordFailure(host, endpoint)
+			cb.recordFailure(host, endpoint, start, time.Now())
 			return nil, err
 		}
 
-		cb.recordAttempt(host, endpoint)
+		cb.recordAttempt(host, endpoint, start, time.Now())
 		// Clone the request to avoid reuse issues with Body on retries
 		newReq := req.Clone(req.Context())
 
 		// Attempt the request
 		resp, err := cl.Do(newReq)
 		if err == nil {
-			cb.recordSuccess(host, endpoint)
+			cb.recordSuccess(host, endpoint, start, time.Now())
 			return resp, nil // Success
 		}
 
-		cb.recordFailure(host, endpoint)
+		cb.recordFailure(host, endpoint, start, time.Now())
 		// Return immediately if the error is not retryable
 		if !isRetryable(err) {
 			return nil, err
@@ -142,7 +143,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 
 		// If retries remain, back off slightly before trying again
 		if attempt < cb.MaxRetries {
-			cb.recordRetry(host, endpoint)
+			cb.recordRetry(host, endpoint, start, time.Now())
 			time.Sleep(500 * time.Millisecond)
 		}
 	}
@@ -218,27 +219,35 @@ func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
 	return result
 }
 
-func (cb *circuitBreaker) recordAttempt(host, endpoint string) {
+func (cb *circuitBreaker) recordAttempt(host, endpoint string, start, end time.Time) {
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.TotalRequests++
+		m.TimeRequests = append(m.TimeRequests, end.Sub(start).Seconds())
+		m.MeanRequests, _ = avgLastNItens(m.TimeRequests, 20)
 	})
 }
 
-func (cb *circuitBreaker) recordSuccess(host, endpoint string) {
+func (cb *circuitBreaker) recordSuccess(host, endpoint string, start, end time.Time) {
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.SuccessfulRequests++
+		m.TimeSuccessfulRequests = append(m.TimeSuccessfulRequests, end.Sub(start).Seconds())
+		m.MeanSuccessfulRequests, _ = avgLastNItens(m.TimeSuccessfulRequests, 20)
 	})
 }
 
-func (cb *circuitBreaker) recordFailure(host, endpoint string) {
+func (cb *circuitBreaker) recordFailure(host, endpoint string, start, end time.Time) {
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.FailedRequests++
+		m.TimeFailedRequests = append(m.TimeFailedRequests, end.Sub(start).Seconds())
+		m.MeanFailedRequests, _ = avgLastNItens(m.TimeFailedRequests, 20)
 	})
 }
 
-func (cb *circuitBreaker) recordRetry(host, endpoint string) {
+func (cb *circuitBreaker) recordRetry(host, endpoint string, start, end time.Time) {
 	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
 		m.RetryCount++
+		m.TimeRetry = append(m.TimeRetry, end.Sub(start).Seconds())
+		m.MeanRetry, _ = avgLastNItens(m.TimeRetry, 20)
 	})
 }
 
@@ -263,4 +272,20 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*En
 	}
 
 	updateFn(endpointMetrics)
+}
+
+func avgLastNItens(xs []float64, size int) (avg float64, count int) {
+	if len(xs) == 0 {
+		return 0, 0
+	}
+	start := 0
+	if len(xs) > size {
+		start = len(xs) - size
+	}
+	sum := 0.0
+	for _, v := range xs[start:] {
+		sum += v
+	}
+	count = len(xs) - start
+	return sum / float64(count), count
 }

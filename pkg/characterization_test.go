@@ -310,8 +310,16 @@ func TestCharacterization_ExhaustionErrorText(t *testing.T) {
 	if err.Error() != "request failed after retries" {
 		t.Fatalf("texto do erro é contrato informal e não pode mudar: %q", err.Error())
 	}
+	// F7 (atualização deliberada de característica): o texto permanece
+	// idêntico e a causa passa a ser recuperável — ganho aditivo.
+	if !errors.Is(err, circuitbreaker.ErrRetriesExhausted) {
+		t.Fatal("errors.Is(ErrRetriesExhausted) deveria ser true (F7)")
+	}
 	var ne net.Error
-	if errors.As(err, &ne) {
-		t.Fatalf("característica original: a causa NÃO é recuperável via errors.As (será mudado pelo F7)")
+	if !errors.As(err, &ne) {
+		t.Fatal("errors.As deveria recuperar a causa net.Error (F7)")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("errors.Is deveria alcançar a causa exata através do wrap: %v", err)
 	}
 }

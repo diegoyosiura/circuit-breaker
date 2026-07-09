@@ -6,10 +6,8 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
 	"slices"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -151,6 +149,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		endpoint = "/"
 	}
 
+	var lastErr error
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
 		start := time.Now()
 		if err := cb.waitForToken(req.Context()); err != nil {
@@ -178,6 +177,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 			return resp, nil // Success
 		}
 
+		lastErr = err
 		cb.recordFailure(host, endpoint, start, time.Now())
 		// Return immediately if the error is not retryable
 		if !isRetryable(err) {
@@ -204,8 +204,9 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		}
 	}
 
-	// All retry attempts failed
-	return nil, errors.New("request failed after retries")
+	// All retry attempts failed. The text is frozen (informal contract);
+	// the last cause is recoverable via errors.Is/As (F7).
+	return nil, &retriesExhaustedError{last: lastErr}
 }
 
 // Stop gracefully shuts down the token bucket goroutine.
@@ -246,27 +247,26 @@ func (cb *circuitBreaker) waitForToken(ctx context.Context) error {
 	}
 }
 
-// isRetryable checks if an error is considered transient/retryable,
-// such as timeouts, connection resets, or temporary network failures.
+// isRetryable classifies transient failures. Behaviour frozen by the
+// characterization table (T0.2, CB-TESTES.md scenario 24):
+//   - retryable: net.Error with Timeout() or Temporary() true (genuine
+//     timeouts, os.ErrDeadlineExceeded, temporary conditions)
+//   - NOT retryable: ECONNRESET/ECONNREFUSED (their Timeout/Temporary are
+//     false — retrying a refused connection would hammer a downed service),
+//     generic errors, and retryable errors wrapped with %w inside the
+//     transport (url.Error probes e.Err by direct type-assertion).
+//
+// The former branches below this check (*net.OpError, errors.Is ECONNRESET/
+// ECONNREFUSED/ErrDeadlineExceeded) were unreachable dead code: every such
+// error already satisfies net.Error and is decided here [F8/D1].
+//
+//nolint:staticcheck // Temporary() é deprecated, mas removê-lo mudaria o
+// comportamento efetivo em produção — decisão D1 do PLANO.md.
 func isRetryable(err error) bool {
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return netErr.Temporary() || netErr.Timeout()
 	}
-
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return true
-	}
-
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
-		return true
-	}
-
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-
 	return false
 }
 

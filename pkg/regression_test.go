@@ -333,7 +333,7 @@ func TestRegression_ExtremeRateNoBusyLoop(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &after)
 	cpu := time.Duration(after.Utime.Nano()+after.Stime.Nano()) - time.Duration(before.Utime.Nano()+before.Stime.Nano())
-	if cpu > 150*time.Millisecond { // >30% de 1 core em 500ms de ociosidade
+	if cpu > 25*time.Millisecond { // >5% de 1 core em 500ms de ociosidade
 		t.Fatalf("refiller queimando CPU ociosa: %v em 500ms", cpu)
 	}
 	t.Logf("CPU ociosa em 500ms: %v (construtor: %v)", cpu, built)

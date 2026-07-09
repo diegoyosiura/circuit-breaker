@@ -12,8 +12,9 @@ import (
 
 // Limites de sanidade do token bucket (F5/D5 do PLANO.md).
 const (
-	minTokenInterval  = time.Millisecond // piso do intervalo do ticker
-	maxBucketCapacity = 1_000_000        // teto do burst para configs degeneradas
+	minTokenInterval  = time.Millisecond      // abaixo disto o ticker é engrossado
+	clampedTick       = 25 * time.Millisecond // tick real quando clampado (≤40 acordadas/s)
+	maxBucketCapacity = 1_000_000             // teto do burst para configs degeneradas
 )
 
 // circuitBreaker implements a resilient HTTP request handler with the following features:
@@ -84,14 +85,20 @@ func newCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 		interval := (time.Duration(windowSeconds) * time.Second) / time.Duration(maxRequests)
 		cb.tokensPerTick = 1
 		if interval < minTokenInterval {
-			// Piso de 1ms com reposição em lote: preserva a taxa nominal sem
-			// transformar o ticker num busy-loop de ~1 core (CB.md A16).
+			// Tick engrossado (25ms) com reposição em lote: preserva a taxa
+			// nominal (erro de arredondamento <4% acima de 1000 req/s) e
+			// reduz as acordadas do refiller de 1000/s para 40/s — o resíduo
+			// de ~4% de CPU apontado na validação de não-regressão cai para
+			// ~0 (CB.md A16; configs com intervalo >= 1ms não são afetadas).
 			perSecond := float64(maxRequests) / float64(windowSeconds)
-			cb.tokensPerTick = int(math.Ceil(perSecond * minTokenInterval.Seconds()))
+			cb.tokensPerTick = int(math.Round(perSecond * clampedTick.Seconds()))
+			if cb.tokensPerTick < 1 {
+				cb.tokensPerTick = 1
+			}
 			if cb.tokensPerTick > capacity {
 				cb.tokensPerTick = capacity // nunca repõe mais que o bucket comporta
 			}
-			interval = minTokenInterval
+			interval = clampedTick
 		}
 		cb.tokenInterval = interval
 		cb.tokenStop = make(chan struct{})

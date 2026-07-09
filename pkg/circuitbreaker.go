@@ -132,6 +132,13 @@ func (cb *circuitBreaker) startTokenBucket() {
 // - Retry logic is applied on retryable errors
 // - Context cancellation or timeout is observed
 func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
+	// R1: nil client falls back to http.DefaultClient instead of panicking.
+	// Callers SHOULD provide a client with Timeout (or a request deadline):
+	// a hung server otherwise pins the semaphore slot forever (CB.md A10).
+	if cl == nil {
+		cl = http.DefaultClient
+	}
+
 	if cb.sem != nil {
 		// Wait for a concurrency slot or return if context is cancelled
 		select {
@@ -152,7 +159,14 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
 		start := time.Now()
 		if err := cb.waitForToken(req.Context()); err != nil {
+			// Semântica original preservada (D3): o cancelamento conta como
+			// falha SEM tentativa (failed pode exceder total). O contador
+			// aditivo abaixo permite distinguir cancelamentos locais de
+			// falhas remotas nos dashboards [R4].
 			cb.recordFailure(host, endpoint, start, time.Now())
+			if !errors.Is(err, ErrStopped) {
+				cb.recordTokenCancel(host, endpoint)
+			}
 			return nil, err
 		}
 
@@ -306,6 +320,12 @@ func (cb *circuitBreaker) recordFailure(host, endpoint string, start, end time.T
 	cb.updateMetrics(host, endpoint, func(s *endpointState) {
 		s.failedRequests++
 		s.failure.record(start, end)
+	})
+}
+
+func (cb *circuitBreaker) recordTokenCancel(host, endpoint string) {
+	cb.updateMetrics(host, endpoint, func(s *endpointState) {
+		s.tokenWaitCancellations++
 	})
 }
 

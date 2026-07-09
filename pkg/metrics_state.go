@@ -150,10 +150,11 @@ func (f *familyState) record(start, end time.Time) {
 
 // endpointState é o estado vivo de um host/endpoint (e do agregado ::root).
 type endpointState struct {
-	totalRequests      int64
-	successfulRequests int64
-	failedRequests     int64
-	retryCount         int64
+	totalRequests          int64
+	successfulRequests     int64
+	failedRequests         int64
+	retryCount             int64
+	tokenWaitCancellations int64
 
 	req     familyState
 	success familyState
@@ -165,10 +166,11 @@ type endpointState struct {
 // cópias novas; nenhum aliasing com o estado vivo.
 func (s *endpointState) snapshot() EndpointMetrics {
 	return EndpointMetrics{
-		TotalRequests:      s.totalRequests,
-		SuccessfulRequests: s.successfulRequests,
-		FailedRequests:     s.failedRequests,
-		RetryCount:         s.retryCount,
+		TotalRequests:          s.totalRequests,
+		SuccessfulRequests:     s.successfulRequests,
+		FailedRequests:         s.failedRequests,
+		RetryCount:             s.retryCount,
+		TokenWaitCancellations: s.tokenWaitCancellations,
 
 		MeanRequests:           s.req.mean,
 		MeanSuccessfulRequests: s.success.mean,

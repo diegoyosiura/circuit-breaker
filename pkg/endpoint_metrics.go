@@ -9,6 +9,12 @@ type EndpointMetrics struct {
 	FailedRequests     int64 `json:"failed_requests"`
 	RetryCount         int64 `json:"retry_count"`
 
+	// TokenWaitCancellations conta contextos cancelados/expirados durante a
+	// espera por token (campo ADITIVO — R4). Nesses eventos FailedRequests
+	// também é incrementado sem TotalRequests (semântica histórica D3), então
+	// failed > total indica cancelamento local, não falha remota.
+	TokenWaitCancellations int64 `json:"token_wait_cancellations,omitempty"`
+
 	MeanRequests           float64 `json:"mean_requests"`
 	MeanSuccessfulRequests float64 `json:"mean_successful_requests"`
 	MeanFailedRequests     float64 `json:"mean_failed_requests"`

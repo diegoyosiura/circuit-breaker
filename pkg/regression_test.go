@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"syscall"
@@ -391,4 +392,127 @@ func TestRegression_PerRequestCostFlat(t *testing.T) {
 		t.Fatalf("custo por request cresce com o histórico: bloco5/bloco1 = %.2fx (limite 1,2)", ratio)
 	}
 	t.Logf("razão bloco5/bloco1 = %.2fx", ratio)
+}
+
+// R1 [A10] — client nil usa http.DefaultClient em vez de panicar.
+func TestRegression_NilClientUsesDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cb := circuitbreaker.NewCircuitBreaker("r1", 1, 0, 0, 0)
+	defer cb.Stop()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	resp, err := cb.Do(req, nil) // antes: nil pointer panic dentro de cl.Do
+	if err != nil {
+		t.Fatalf("Do com client nil: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+}
+
+// R2 — lifecycle opcional do manager: List/Remove/StopAll via type assertion.
+func TestRegression_ManagerLifecycle(t *testing.T) {
+	m := circuitbreaker.NewManager()
+	lc, ok := m.(circuitbreaker.IManagerLifecycle)
+	if !ok {
+		t.Fatal("manager deveria implementar IManagerLifecycle")
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		m.NewCircuitBreaker(name, 0, 10, 1, 0)
+	}
+	if got := len(lc.List()); got != 3 {
+		t.Fatalf("List: %d nomes", got)
+	}
+
+	lc.Remove("b")
+	if m.GetCircuitBreaker("b") != nil {
+		t.Fatal("Remove deveria desregistrar")
+	}
+	if got := len(lc.List()); got != 2 {
+		t.Fatalf("List pós-Remove: %d", got)
+	}
+	lc.Remove("inexistente") // no-op, sem panic
+
+	lc.StopAll()
+	lc.StopAll() // idempotente
+	if got := len(lc.List()); got != 2 {
+		t.Fatalf("StopAll mantém o registro: %d", got)
+	}
+	// breakers parados respondem ErrStopped quando o bucket esgota
+	cbA := m.GetCircuitBreaker("a")
+	cl := &http.Client{Transport: &countingTransport{}}
+	req, _ := http.NewRequest(http.MethodGet, "http://r2.test/x", nil)
+	for range 11 { // 10 sobras do bucket + 1 chamada que encontra ErrStopped
+		if _, err := cbA.Do(req, cl); errors.Is(err, circuitbreaker.ErrStopped) {
+			return
+		}
+	}
+	t.Fatal("após StopAll e bucket esgotado, esperava ErrStopped")
+}
+
+// R3 — modo estrito acusa configuração divergente.
+func TestRegression_ManagerStrict(t *testing.T) {
+	m := circuitbreaker.NewManager()
+	st, ok := m.(circuitbreaker.IManagerStrict)
+	if !ok {
+		t.Fatal("manager deveria implementar IManagerStrict")
+	}
+
+	cb1, err := st.NewCircuitBreakerStrict("svc", 1, 10, 60, 0)
+	if err != nil {
+		t.Fatalf("primeira criação: %v", err)
+	}
+	cb2, err := st.NewCircuitBreakerStrict("svc", 1, 10, 60, 0) // mesma config
+	if err != nil || cb1 != cb2 {
+		t.Fatalf("mesma config deveria reusar sem erro: %v", err)
+	}
+	if _, err := st.NewCircuitBreakerStrict("svc", 99, 999, 1, 5); err == nil {
+		t.Fatal("config divergente deveria retornar erro")
+	}
+	// O modo clássico permanece silencioso (característica preservada).
+	if cb3 := m.NewCircuitBreaker("svc", 99, 999, 1, 5); cb3 != cb1 {
+		t.Fatal("NewCircuitBreaker clássico deve manter o get-or-create silencioso")
+	}
+	cb1.Stop()
+}
+
+// R4 — cancelamentos na espera de token ganham contador próprio (aditivo);
+// os contadores históricos não mudam (D3).
+func TestRegression_TokenWaitCancellationsCounted(t *testing.T) {
+	cb := circuitbreaker.NewCircuitBreaker("r4", 0, 1, 3600, 0)
+	defer cb.Stop()
+	cl := &http.Client{Transport: &countingTransport{}}
+	req, _ := http.NewRequest(http.MethodGet, "http://r4.test/x", nil)
+
+	resp, err := cb.Do(req, cl) // consome o token
+	if err != nil {
+		t.Fatalf("primeira chamada: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, err = cb.Do(req.WithContext(ctx), cl)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("esperava DeadlineExceeded: %v", err)
+		}
+	}
+
+	m := cb.Metrics()["r4.test"]["/x"]
+	if m.TokenWaitCancellations != 3 {
+		t.Fatalf("TokenWaitCancellations: %d (esperado 3)", m.TokenWaitCancellations)
+	}
+	if m.FailedRequests != 3 || m.TotalRequests != 1 {
+		t.Fatalf("contadores históricos devem preservar D3: %+v", m)
+	}
+	root := cb.Metrics()["r4.test"]["::root"]
+	if root.TokenWaitCancellations != 3 {
+		t.Fatalf("::root também acumula: %d", root.TokenWaitCancellations)
+	}
 }

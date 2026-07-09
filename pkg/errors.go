@@ -23,3 +23,10 @@ func (e *retriesExhaustedError) Is(target error) bool {
 // failed with a retryable error. The concrete error also unwraps to the
 // last underlying failure.
 var ErrRetriesExhausted error = &retriesExhaustedError{}
+
+// ErrCircuitOpen is returned by Do when the opt-in state machine
+// (WithBreaker) is OPEN or half-open with all probe slots taken: the request
+// fast-fails WITHOUT touching the downstream, giving it time to recover and
+// letting the caller trigger a fallback. Never returned by breakers created
+// without WithBreaker.
+var ErrCircuitOpen = errors.New("circuit breaker is open")

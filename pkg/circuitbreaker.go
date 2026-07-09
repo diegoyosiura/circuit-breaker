@@ -33,6 +33,13 @@ type circuitBreaker struct {
 
 	backoff time.Duration // Delay between retry attempts (default 500ms)
 
+	// Fase 4 (opt-in via NewCircuitBreakerWithOptions; nil/zero = inerte)
+	state          *breakerState     // máquina closed/open/half-open (WithBreaker)
+	statusFailMin  int               // status >= min conta como falha (WithStatusCodeFailure)
+	retryPolicy    func(error) bool  // substitui isRetryable (WithRetryPolicy)
+	expBackoff     *expBackoffConfig // backoff exponencial (WithExponentialBackoff)
+	defaultTimeout time.Duration     // teto quando o chamador não define nenhum (WithDefaultTimeout)
+
 	tokenWaitGroup sync.WaitGroup // WaitGroup to ensure graceful token goroutine shutdown
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 
@@ -47,6 +54,12 @@ type circuitBreaker struct {
 // - windowSeconds: Duration of the rate-limiting window
 // - maxRetries: Max number of retry attempts on failure
 func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSeconds int, maxRetries int) ICircuitBreaker {
+	return newCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
+}
+
+// newCircuitBreaker é o núcleo concreto compartilhado por NewCircuitBreaker
+// e NewCircuitBreakerWithOptions.
+func newCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSeconds int, maxRetries int) *circuitBreaker {
 	cb := &circuitBreaker{
 		Name:          name,
 		MaxConcurrent: maxConcurrent,
@@ -142,12 +155,36 @@ func (cb *circuitBreaker) startTokenBucket() {
 // HTTP status: 4xx/5xx count as successes in the metrics; inspect
 // resp.StatusCode. After Stop(), Do returns ErrStopped once the remaining
 // tokens are exhausted.
-func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
+func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *http.Response, finalErr error) {
 	// R1: nil client falls back to http.DefaultClient instead of panicking.
 	// Callers SHOULD provide a client with Timeout (or a request deadline):
 	// a hung server otherwise pins the semaphore slot forever (CB.md A10).
 	if cl == nil {
 		cl = http.DefaultClient
+	}
+
+	// WithDefaultTimeout: aplica-se APENAS quando o chamador não definiu
+	// nenhum limite (client sem Timeout e request sem deadline).
+	if cb.defaultTimeout > 0 && cl.Timeout == 0 {
+		if _, has := req.Context().Deadline(); !has {
+			ctx, cancel := context.WithTimeout(req.Context(), cb.defaultTimeout)
+			defer cancel()
+			req = req.WithContext(ctx)
+		}
+	}
+
+	// WithBreaker: fast-fail ANTES de consumir semáforo/token — o propósito
+	// do circuito aberto é não gastar recurso algum com downstream doente.
+	probe := false
+	if cb.state != nil {
+		var allowErr error
+		probe, allowErr = cb.state.allow(time.Now())
+		if allowErr != nil {
+			return nil, allowErr
+		}
+		defer func() {
+			cb.state.report(probe, classifyOutcome(finalResp, finalErr, cb.statusFailMin))
+		}()
 	}
 
 	if cb.sem != nil {
@@ -197,14 +234,25 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		// Attempt the request
 		resp, err := cl.Do(newReq)
 		if err == nil {
-			cb.recordSuccess(host, endpoint, start, time.Now())
-			return resp, nil // Success
+			// WithStatusCodeFailure: classifica 4xx/5xx como falha nas
+			// métricas (a resposta continua sendo devolvida com err == nil).
+			if cb.statusFailMin > 0 && resp.StatusCode >= cb.statusFailMin {
+				cb.recordFailure(host, endpoint, start, time.Now())
+			} else {
+				cb.recordSuccess(host, endpoint, start, time.Now())
+			}
+			return resp, nil // Success (transport-level)
 		}
 
 		lastErr = err
 		cb.recordFailure(host, endpoint, start, time.Now())
 		// Return immediately if the error is not retryable
-		if !isRetryable(err) {
+		// (WithRetryPolicy substitui a classificação padrão)
+		retryable := isRetryable
+		if cb.retryPolicy != nil {
+			retryable = cb.retryPolicy
+		}
+		if !retryable(err) {
 			return nil, err
 		}
 
@@ -223,7 +271,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 			select {
 			case <-req.Context().Done():
 				return nil, req.Context().Err()
-			case <-time.After(cb.backoff):
+			case <-time.After(cb.backoffFor(attempt)):
 			}
 		}
 	}

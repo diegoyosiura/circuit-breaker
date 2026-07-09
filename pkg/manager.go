@@ -10,9 +10,12 @@ import (
 // is only instantiated once and reused for all future requests.
 //
 // This design enables:
-// - Centralized lifecycle management
-// - Thread-safe access to named CircuitBreakers
-// - Avoidance of redundant instantiations
+//   - Thread-safe access to named CircuitBreakers
+//   - Avoidance of redundant instantiations
+//   - Centralized lifecycle management via the OPTIONAL interfaces
+//     IManagerLifecycle (List/Remove/StopAll) and IManagerStrict
+//     (creation that rejects divergent configurations), both discovered
+//     by type assertion — IManager itself is frozen.
 // breakerConfig guarda os parâmetros com que cada breaker foi criado —
 // base do modo estrito (R3), que acusa configurações divergentes.
 type breakerConfig struct {

@@ -1,134 +1,147 @@
-# Circuit Breaker and Test Harness (Go)
+# Circuit Breaker (Go)
 
 ![Production](https://img.shields.io/badge/status-production-brightgreen)
-![Go Version](https://img.shields.io/badge/go-1.20+-blue)
+![Go Version](https://img.shields.io/badge/go-1.26+-blue)
 ![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/go.yml/badge.svg)
-![Coverage](https://img.shields.io/codecov/c/github/your-org/your-repo)
 
-This repository demonstrates a **fully-featured Circuit Breaker** written in Go, along with a **simulated HTTP server** to test request handling under constraints such as:
+Cliente HTTP resiliente, sem dependências externas (só stdlib), que compõe três padrões de proteção mais observabilidade:
 
-- **Rate limiting** (token bucket algorithm)
-- **Concurrency control** (via semaphores)
-- **Retry logic** (on transient network errors)
-- **Context support** (timeouts and cancellations)
-- **Live metrics** through the FakeServer
+- **Bulkhead** — limite de requisições simultâneas (semáforo);
+- **Rate limiting** — token bucket com reposição contínua;
+- **Retry** — re-tentativas para erros transitórios de rede, com corpo re-enviado corretamente via `GetBody`;
+- **Métricas** — contadores, médias móveis (últimas 20) e contagens por janela (1/5/10 min) por host/endpoint, com agregado `::root` por host.
 
----
-
-## ✨ Features
-
-### Circuit Breaker (`pkg/circuitbreaker.go`)
-- Limits max **concurrent HTTP requests**.
-- Enforces **rate limit** using a **token bucket**.
-- Retries requests **on network failures** (e.g., timeout, connection refused).
-- Observes **context cancellation** or timeout.
-
-### Manager (`pkg/manager.go`)
-- Keeps a **registry of named CircuitBreakers**.
-- Ensures a single instance per name (singleton pattern).
-- Thread-safe with `sync.Mutex`.
-
-### Fake Server (`internal/fakeserver.go`)
-- Simulates real-world delay (1–5s per request).
-- Tracks and logs:
-    - Current and maximum simultaneous connections
-    - Requests per second (RPS)
-    - Maximum RPS
-    - Average RPS
+> **Nota de escopo:** apesar do nome, o componente **não implementa a máquina de estados** *closed/open/half-open* do padrão Circuit Breaker clássico — não há *fast-fail* quando o downstream está degradado. A análise completa de arquitetura e comportamento está em [`CB.md`](CB.md); a validação empírica em [`CB-TESTES.md`](CB-TESTES.md); o roadmap em [`PLANO.md`](PLANO.md).
 
 ---
 
-## ⚙️ How It Works
+## Instalação
 
-### Token Bucket (Rate Limiting)
-- Tokens are added to a buffered channel (`cb.tokens`) at regular intervals.
-- Each request consumes one token.
-- If no tokens are available, the request **waits** (or is canceled by context).
+```bash
+go get github.com/diegoyosiura/circuit-breaker
+```
 
-### Semaphore (Concurrency Limit)
-- A buffered channel (`cb.sem`) is used to block when max parallel requests are reached.
-
-### Retry with Context Awareness
-- On transient failure, requests are retried up to `MaxRetries`.
-- Between retries, a short backoff is applied.
-- If the context expires or is canceled, retry loop is exited.
-
----
-
-## 🔧 Usage Example
+## Uso
 
 ```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
+)
+
 func main() {
-    fs := internal.NewFakeServer("localhost", 8080)
-    go fs.Listen()
-    time.Sleep(5 * time.Second) // Give server time to start
+	m := circuitbreaker.NewManager()
 
-    manager := circuitbreaker.NewManager()
-    cb := manager.NewCircuitBreaker("google", 50, 200, 30, 5) // name, concurrency, max reqs, window (s), retries
+	// name, maxConcurrent, maxRequests, windowSeconds, maxRetries
+	cb := m.NewCircuitBreaker("minha-api", 50, 200, 30, 3)
 
-    var wg sync.WaitGroup
-    total := 1000 // Total number of requests to simulate
+	// SEMPRE use um client com Timeout (ou um request com deadline):
+	// um servidor que aceita a conexão e nunca responde prenderia um
+	// slot do semáforo indefinidamente.
+	cl := &http.Client{Timeout: 10 * time.Second}
 
-    for i := 0; i < total; i++ {
-        wg.Add(1)
-        go func(i int) {
-            defer wg.Done()
-            req, _ := http.NewRequest("GET", "http://localhost:8080/teste", nil)
-            resp, err := cb.Do(req)
-            if err != nil {
-                fmt.Printf("[Req %04d] ERROR: %v\n", i, err)
-                return
-            }
-            defer resp.Body.Close()
-            fmt.Printf("[Req %04d] OK: %s\n", i, resp.Status)
-        }(i)
-    }
+	req, err := http.NewRequest(http.MethodGet, "https://example.com/dados", nil)
+	if err != nil {
+		panic(err)
+	}
 
-    wg.Wait()
+	resp, err := cb.Do(req, cl)
+	if err != nil {
+		fmt.Println("erro:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// IMPORTANTE: err == nil significa que o transporte funcionou.
+	// Status 4xx/5xx chegam aqui como "sucesso" — inspecione o código:
+	if resp.StatusCode >= 400 {
+		fmt.Println("resposta com erro HTTP:", resp.Status)
+		return
+	}
+	fmt.Println("ok:", resp.Status)
+
+	// Shutdown gracioso: pare os breakers registrados.
+	if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
+		lc.StopAll()
+	}
 }
 ```
 
----
+## Semântica dos parâmetros
 
-## ✅ Metrics Output
+| Parâmetro | Efeito | Valor ≤ 0 |
+|---|---|---|
+| `name` | Identificador (chave no Manager) | — |
+| `maxConcurrent` | Máximo de requisições simultâneas | desativa o limite |
+| `maxRequests` + `windowSeconds` | Capacidade do bucket e taxa de reposição | qualquer um ≤ 0 desativa o rate limit |
+| `maxRetries` | Re-tentativas além da inicial (total = `maxRetries+1`) | 0 = sem retry |
 
-Every 5 seconds, the FakeServer logs:
+Propriedades importantes:
 
+- **Burst**: o bucket nasce cheio; na primeira janela passam até ~2× `maxRequests` (comportamento canônico de token bucket, medido em 1,95–2,00×). A taxa sustentada converge para `maxRequests/windowSeconds`.
+- **Retry**: só para erros com `Timeout()`/`Temporary()` verdadeiros (timeouts genuínos). `ECONNREFUSED`/`ECONNRESET` **não** são retentados — não martelamos serviço caído. Corpos são re-enviados via `req.GetBody`; corpos não-rebobináveis não são retentados.
+- **Backoff**: fixo de 500 ms entre tentativas, interrompível pelo contexto.
+- **`Stop()`**: idempotente; depois dele, chamadas são liberadas com `ErrStopped` assim que os tokens remanescentes se esgotam.
+- **Exaustão de retries**: o erro devolvido tem o texto estável `"request failed after retries"`, responde a `errors.Is(err, circuitbreaker.ErrRetriesExhausted)` e desembrulha a última causa via `errors.As`/`errors.Is`.
+
+## Manager
+
+`NewManager()` devolve um registro nomeado (uma instância por nome):
+
+- `NewCircuitBreaker(name, ...)` — *get-or-create*; se o nome já existe, **os parâmetros são ignorados** e a instância original é devolvida.
+- `GetCircuitBreaker(name)` — devolve `nil` para nome desconhecido.
+
+Extensões **opcionais** (descobertas por type assertion, sem quebrar `IManager`):
+
+```go
+if st, ok := m.(circuitbreaker.IManagerStrict); ok {
+	cb, err := st.NewCircuitBreakerStrict("svc", 10, 100, 60, 2)
+	// err != nil se "svc" já existir com configuração DIFERENTE
+	_ = cb
+	_ = err
+}
+if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
+	names := lc.List() // nomes registrados
+	lc.Remove("svc")   // Stop() + desregistro
+	lc.StopAll()       // shutdown gracioso de todos
+	_ = names
+}
 ```
-📊 Max simultaneous: 50 | Max req/s: 40 | Avg req/s: 1.66
+
+## Métricas
+
+`cb.Metrics()` devolve um snapshot **imutável** (`map[host]map[endpoint]EndpointMetrics`, mais `::root` agregando cada host). Semântica dos campos:
+
+| Campo (JSON) | O que mede |
+|---|---|
+| `total_requests` | Tentativas que obtiveram token (retries contam de novo) |
+| `successful_requests` | Tentativas sem erro de transporte (**inclui 4xx/5xx**) |
+| `failed_requests` | Tentativas com erro **+ cancelamentos na espera de token** (pode exceder `total_requests`) |
+| `retry_count` | Re-tentativas agendadas |
+| `token_wait_cancellations` | Contextos cancelados/expirados esperando token (distingue cancelamento local de falha remota) |
+| `mean_requests` | Média das últimas 20 esperas por token (s) |
+| `mean_successful_requests` | Média das últimas 20 durações espera+round-trip (s) |
+| `ratio_01/05/10_*` | Contagem de eventos nos últimos 1/5/10 minutos (calculada no registro) |
+
+## Política de compatibilidade
+
+O contrato público (`ICircuitBreaker`, `IManager`, construtores, campos e tags de `EndpointMetrics`) é **congelado**: mudanças são sempre aditivas (novas funções, interfaces opcionais, campos com `omitempty`). Quebra de contrato exigirá um module path `/v2`.
+
+## Desenvolvimento
+
+```bash
+go vet ./...
+go test -race -count=1 ./...
+go test -bench BenchmarkDo -benchtime 2000x ./pkg/
 ```
 
-This helps validate if the CircuitBreaker is enforcing:
-- Maximum concurrency
-- Requests per second (as calculated from maxRequests/windowSeconds)
+A suíte inclui **testes de característica** (`pkg/characterization_test.go`) que congelam a semântica observável, um **sentinela de contrato** (`pkg/contract_test.go`) que quebra a compilação se o contrato mudar, e **testes de regressão** para cada bug corrigido (`pkg/regression_test.go`). O harness de demonstração fica em `cmd/main.go` e o servidor de bancada em `internal/fakeserver.go` (porta 0 = efêmera; múltiplas instâncias simultâneas).
 
----
+## Licença
 
-## ⚠️ Notes & Recommendations
-
-- Use `cb.Stop()` to gracefully shut down token generators when your app exits.
-- Tune `MaxRequests` and `WindowSeconds` to control **rate**.
-- Tune `MaxConcurrent` to control **parallelism**.
-- The system assumes requests are **stateless** and idempotent if retries are enabled.
-
----
-
-## 🚀 Extending This Project
-
-- Export metrics to **Prometheus**
-- Add **backoff strategies** (exponential, jittered)
-- Support other transports (e.g. gRPC)
-- Add circuit "open/close" state tracking
-
----
-
-## ✨ Authors
-
-Developed by Diego Yosiura. Contributions welcome!
-
----
-
-## 📝 License
-
-This project is open-sourced under the MIT License.
-
+MIT — desenvolvido por Diego Yosiura. Contribuições são bem-vindas.

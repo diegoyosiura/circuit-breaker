@@ -128,9 +128,20 @@ func (cb *circuitBreaker) startTokenBucket() {
 }
 
 // Do executes the HTTP request, ensuring that:
-// - Concurrency and rate limits are respected
-// - Retry logic is applied on retryable errors
-// - Context cancellation or timeout is observed
+//   - Concurrency and rate limits are respected (the semaphore slot is held
+//     for the WHOLE call, including every retry and backoff wait)
+//   - Retry logic is applied on retryable errors (net.Error with Timeout or
+//     Temporary true — see isRetryable); bodies are replayed via GetBody,
+//     and non-rewindable bodies are never retried
+//   - Context cancellation or timeout is observed, including during backoff
+//
+// cl may be nil (http.DefaultClient is used); callers SHOULD supply a client
+// with Timeout or a request deadline — a server that accepts the connection
+// and never answers would otherwise pin a semaphore slot indefinitely.
+// A response is returned whenever the transport succeeds, REGARDLESS of the
+// HTTP status: 4xx/5xx count as successes in the metrics; inspect
+// resp.StatusCode. After Stop(), Do returns ErrStopped once the remaining
+// tokens are exhausted.
 func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response, error) {
 	// R1: nil client falls back to http.DefaultClient instead of panicking.
 	// Callers SHOULD provide a client with Timeout (or a request deadline):
@@ -222,8 +233,10 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 	return nil, &retriesExhaustedError{last: lastErr}
 }
 
-// Stop gracefully shuts down the token bucket goroutine.
-// Should be called when the circuit is no longer needed.
+// Stop gracefully shuts down the token bucket goroutine. Idempotent and
+// safe for concurrent use. After Stop, in-flight and future Do calls are
+// released with ErrStopped once the tokens remaining in the bucket are
+// consumed. A breaker without rate limit has nothing to stop (no-op).
 func (cb *circuitBreaker) Stop() {
 	if cb.tokenStop == nil {
 		return

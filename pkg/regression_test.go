@@ -5,7 +5,9 @@ package circuitbreaker_test
 
 import (
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -176,5 +178,66 @@ func TestRegression_LeftoverTokensStillServed(t *testing.T) {
 	}
 	if _, err := cb.Do(req, cl); !errors.Is(err, circuitbreaker.ErrStopped) {
 		t.Fatalf("após esgotar as sobras, esperava ErrStopped: %v", err)
+	}
+}
+
+// F2 [A2, cenário 01] — o retry reenvia o corpo COMPLETO via GetBody.
+func TestRegression_RetryReplaysPostBody(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	attempt := 0
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		attempt++
+		n := attempt
+		mu.Unlock()
+		b, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		if n == 1 {
+			return nil, netError{msg: "temp", temporary: true}
+		}
+		return okResponse(r), nil
+	})
+	cb := circuitbreaker.NewCircuitBreaker("f2", 0, 0, 0, 2)
+	defer cb.Stop()
+	circuitbreaker.SetBackoffForTest(cb, time.Millisecond)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://f2.test/save", strings.NewReader("PAYLOAD-123"))
+	resp, err := cb.Do(req, &http.Client{Transport: tr})
+	if err != nil {
+		t.Fatalf("esperava sucesso após retry: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || bodies[0] != "PAYLOAD-123" || bodies[1] != "PAYLOAD-123" {
+		t.Fatalf("retry não reenviou o corpo completo: %q", bodies)
+	}
+}
+
+// F2 [D2] — corpo não-rebobinável (GetBody == nil) NÃO é retentado.
+func TestRegression_NoRetryWhenBodyNotRewindable(t *testing.T) {
+	tempErr := netError{msg: "temp", temporary: true}
+	tr := &countingTransport{failN: 1 << 30, err: tempErr}
+	cb := circuitbreaker.NewCircuitBreaker("f2b", 0, 0, 0, 5)
+	defer cb.Stop()
+	circuitbreaker.SetBackoffForTest(cb, time.Millisecond)
+
+	req, _ := http.NewRequest(http.MethodPost, "http://f2b.test/save", strings.NewReader("X"))
+	req.GetBody = nil // simula corpo de stream não-rebobinável
+
+	_, err := cb.Do(req, &http.Client{Transport: tr})
+	if err == nil {
+		t.Fatal("esperava erro")
+	}
+	if !errors.Is(err, tempErr) {
+		t.Fatalf("esperava o erro da tentativa, got %v", err)
+	}
+	if tr.count() != 1 {
+		t.Fatalf("corpo não-rebobinável não pode ser retentado: %d chamadas", tr.count())
 	}
 }

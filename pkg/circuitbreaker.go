@@ -129,8 +129,17 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		}
 
 		cb.recordAttempt(host, endpoint, start, time.Now())
-		// Clone the request to avoid reuse issues with Body on retries
 		newReq := req.Clone(req.Context())
+		// Clone copies the Body by reference: the first attempt consumes the
+		// reader, so every retry must rewind it via GetBody (CB.md A2 —
+		// without this, retries resend an empty body).
+		if attempt > 0 && req.Body != nil {
+			body, bodyErr := req.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			newReq.Body = body
+		}
 
 		// Attempt the request
 		resp, err := cl.Do(newReq)
@@ -142,6 +151,13 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		cb.recordFailure(host, endpoint, start, time.Now())
 		// Return immediately if the error is not retryable
 		if !isRetryable(err) {
+			return nil, err
+		}
+
+		// A non-rewindable body (GetBody == nil) cannot be replayed: retrying
+		// would resend a consumed reader (hard failure or silent empty body),
+		// so the attempt's error is returned instead [D2].
+		if req.Body != nil && req.GetBody == nil {
 			return nil, err
 		}
 

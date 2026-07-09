@@ -241,3 +241,37 @@ func TestRegression_NoRetryWhenBodyNotRewindable(t *testing.T) {
 		t.Fatalf("corpo não-rebobinável não pode ser retentado: %d chamadas", tr.count())
 	}
 }
+
+// F4 [A4, cenários 04/05] — as amostras internas são podadas: médias/ratios
+// preservados, memória limitada (antes: len==N para sempre).
+func TestRegression_MetricsBounded(t *testing.T) {
+	cb := circuitbreaker.NewCircuitBreaker("f4", 0, 0, 0, 0)
+	defer cb.Stop()
+	cl := &http.Client{Transport: &countingTransport{}}
+	req, _ := http.NewRequest(http.MethodGet, "http://f4.test/x", nil)
+
+	const n = 5000
+	for range n {
+		resp, err := cb.Do(req, cl)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	for _, key := range []string{"/x", "::root"} {
+		m := cb.Metrics()["f4.test"][key]
+		if m.TotalRequests != n {
+			t.Fatalf("%s: contadores devem ser exatos: total=%d", key, m.TotalRequests)
+		}
+		if m.Ratio01Requests != n {
+			t.Fatalf("%s: ratio01 deve contar a janela completa: %d", key, m.Ratio01Requests)
+		}
+		if len(m.TimeRequests) > 80 {
+			t.Fatalf("%s: TimeRequests não podado: len=%d (era %d sem poda)", key, len(m.TimeRequests), n)
+		}
+		if m.MeanRequests <= 0 && m.TotalRequests > 0 {
+			t.Fatalf("%s: média zerada após poda", key)
+		}
+	}
+}

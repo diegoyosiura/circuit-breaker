@@ -338,6 +338,59 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*En
 
 	updateFn(endpointMetrics)
 	updateFn(cb.metrics[host]["::root"])
+	pruneMetrics(endpointMetrics)
+	pruneMetrics(cb.metrics[host]["::root"])
+}
+
+// Retenção das amostras internas (F4/D4): as médias usam as últimas
+// meanWindow amostras e os ratios a janela de até 10 min — nada além disso
+// precisa ser retido. Antes desta poda os slices cresciam sem teto (leak de
+// memória + custo O(n) por request, CB.md A4).
+const (
+	meanWindow    = 20               // amostras usadas por avgLastNItens
+	pruneTrigger  = 4 * meanWindow   // amortiza a cópia da poda
+	ratioWindow   = 10 * time.Minute // maior janela de repsRatio
+	startsHardCap = 100_000          // teto absoluto de segurança
+)
+
+func pruneMetrics(m *EndpointMetrics) {
+	m.TimeRequests = pruneFloats(m.TimeRequests)
+	m.TimeSuccessfulRequests = pruneFloats(m.TimeSuccessfulRequests)
+	m.TimeFailedRequests = pruneFloats(m.TimeFailedRequests)
+	m.TimeRetry = pruneFloats(m.TimeRetry)
+
+	cutoff := time.Now().Add(-ratioWindow)
+	m.StartTimeRequests = pruneTimes(m.StartTimeRequests, cutoff)
+	m.StartTimeSuccessfulRequests = pruneTimes(m.StartTimeSuccessfulRequests, cutoff)
+	m.StartTimeFailedRequests = pruneTimes(m.StartTimeFailedRequests, cutoff)
+	m.StartTimeRetry = pruneTimes(m.StartTimeRetry, cutoff)
+}
+
+func pruneFloats(xs []float64) []float64 {
+	if len(xs) <= pruneTrigger {
+		return xs
+	}
+	out := make([]float64, meanWindow)
+	copy(out, xs[len(xs)-meanWindow:])
+	return out
+}
+
+func pruneTimes(ts []time.Time, cutoff time.Time) []time.Time {
+	if len(ts) > startsHardCap {
+		ts = ts[len(ts)-startsHardCap:]
+	}
+	// Entradas são cronológicas (pós-F1 nada reordena): descarta o prefixo
+	// fora da janela, copiando apenas quando ao menos metade expirou.
+	expired := 0
+	for expired < len(ts) && ts[expired].Before(cutoff) {
+		expired++
+	}
+	if expired == 0 || expired < len(ts)/2 {
+		return ts
+	}
+	out := make([]time.Time, len(ts)-expired)
+	copy(out, ts[expired:])
+	return out
 }
 
 func avgLastNItens(xs []float64, size int) (avg float64, count int) {

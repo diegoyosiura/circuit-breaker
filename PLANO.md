@@ -1,5 +1,7 @@
 # PLANO.md — Plano de Correção, Otimização, Desempenho e Testes
 
+> **STATUS (2026-07-09): EXECUTADO** na branch `refactor/optimizations` — Fases 0, 1 (F1–F8), 2, 3 (R1–R5) e 5 concluídas com todos os gates verdes; resultados no [`CHANGELOG.md`](CHANGELOG.md). A Fase 4 permanece como decisão de negócio (opt-in). Validação de não-regressão via workflow multiagente registrada ao final do CB-TESTES.md.
+>
 > Plano de engenharia para o `circuit-breaker`, derivado da revisão técnica ([`CB.md`](CB.md)) e das duas campanhas de validação empírica com 27 cenários ([`CB-TESTES.md`](CB-TESTES.md)). **Premissas inegociáveis:** o sistema está **em produção** e o **contrato público não pode quebrar** — nem por alteração de assinatura, nem por adição de método às interfaces exportadas (quebraria mocks/decorators de terceiros). Todo item abaixo é retrocompatível; onde uma correção muda comportamento *observável*, isso está marcado como **decisão de produto** e justificado.
 
 - **Data:** 2026-07-09 · **Base:** HEAD `5e9ffe8` (== `v0.0.7`) · **Evidência:** todos os números citados foram medidos (cenários entre colchetes)

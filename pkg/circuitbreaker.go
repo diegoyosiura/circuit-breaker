@@ -174,9 +174,21 @@ func (cb *circuitBreaker) waitForToken(ctx context.Context) error {
 		return nil
 	}
 
+	// Fast path: tokens já disponíveis são atendidos mesmo após Stop()
+	// (preserva o comportamento observável de "sobras ainda atendem").
+	select {
+	case <-cb.tokens:
+		return nil
+	default:
+	}
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-cb.tokenStop:
+		// Stop() fechou o canal: desbloqueia todos os waiters em vez de
+		// pendurar para sempre goroutines (e slots do semáforo) [A3].
+		return ErrStopped
 	case <-cb.tokens:
 		return nil
 	}

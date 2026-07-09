@@ -8,8 +8,8 @@ decisões D1–D5 do [`PLANO.md`](PLANO.md).
 
 ## [não publicado] — branch `refactor/optimizations` (2026-07-09)
 
-Execução integral do PLANO.md (Fases 0, 1, 2, 3 e 5; a Fase 4 — estados
-open/half-open opt-in — permanece como decisão de negócio futura).
+Execução integral do PLANO.md — Fases 0, 1, 2, 3, 4 (opt-in, inerte por
+default) e 5.
 
 ### Corrigido
 

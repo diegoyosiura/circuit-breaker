@@ -11,7 +11,7 @@ Cliente HTTP resiliente, sem dependências externas (só stdlib), que compõe tr
 - **Retry** — re-tentativas para erros transitórios de rede, com corpo re-enviado corretamente via `GetBody`;
 - **Métricas** — contadores, médias móveis (últimas 20) e contagens por janela (1/5/10 min) por host/endpoint, com agregado `::root` por host.
 
-> **Nota de escopo:** apesar do nome, o componente **não implementa a máquina de estados** *closed/open/half-open* do padrão Circuit Breaker clássico — não há *fast-fail* quando o downstream está degradado. A análise completa de arquitetura e comportamento está em [`CB.md`](CB.md); a validação empírica em [`CB-TESTES.md`](CB-TESTES.md); o roadmap em [`PLANO.md`](PLANO.md).
+> **Nota de escopo:** por default o componente **não ativa a máquina de estados** *closed/open/half-open* do padrão Circuit Breaker clássico — ela existe como **opt-in** via `NewCircuitBreakerWithOptions(..., WithBreaker(...))` (ver seção adiante); sem a opção não há *fast-fail* e o comportamento é o histórico. A análise completa está em [`CB.md`](CB.md); a validação empírica em [`CB-TESTES.md`](CB-TESTES.md); o plano executado em [`PLANO.md`](PLANO.md).
 
 ---
 

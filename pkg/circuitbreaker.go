@@ -215,7 +215,19 @@ func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
 	for host, endpoints := range cb.metrics {
 		endpointCopy := make(map[string]EndpointMetrics, len(endpoints))
 		for endpoint, metrics := range endpoints {
-			endpointCopy[endpoint] = *metrics
+			snapshot := *metrics
+			// Deep-copy: sem isto os campos slice do snapshot compartilham
+			// backing array com os dados vivos (caller e breaker se corrompem
+			// mutuamente).
+			snapshot.TimeRequests = slices.Clone(metrics.TimeRequests)
+			snapshot.TimeSuccessfulRequests = slices.Clone(metrics.TimeSuccessfulRequests)
+			snapshot.TimeFailedRequests = slices.Clone(metrics.TimeFailedRequests)
+			snapshot.TimeRetry = slices.Clone(metrics.TimeRetry)
+			snapshot.StartTimeRequests = slices.Clone(metrics.StartTimeRequests)
+			snapshot.StartTimeSuccessfulRequests = slices.Clone(metrics.StartTimeSuccessfulRequests)
+			snapshot.StartTimeFailedRequests = slices.Clone(metrics.StartTimeFailedRequests)
+			snapshot.StartTimeRetry = slices.Clone(metrics.StartTimeRetry)
+			endpointCopy[endpoint] = snapshot
 		}
 		result[host] = endpointCopy
 	}
@@ -316,31 +328,19 @@ func avgLastNItens(xs []float64, size int) (avg float64, count int) {
 	return sum / float64(count), count
 }
 
-func repsRatio(ts []time.Time, windowMinutes int) (avg int64) {
+// repsRatio counts how many timestamps fall inside the trailing window.
+// It must NOT mutate ts: the slices are shared with snapshots returned by
+// Metrics(), and the previous in-place sort caused a data race (CB.md A1).
+func repsRatio(ts []time.Time, windowMinutes int) int64 {
 	if len(ts) == 0 || windowMinutes <= 0 {
 		return 0
 	}
-
-	slices.SortFunc(ts, func(a, b time.Time) int {
-		switch {
-		case a.After(b):
-			return -1 // a vem antes de b (mais recente primeiro)
-		case a.Before(b):
-			return 1
-		default:
-			return 0
-		}
-	})
-
 	cutoff := time.Now().Add(-time.Duration(windowMinutes) * time.Minute)
-	count := 0
-	// Percorre de trás para frente e para quando sair da janela ou atingir n.
+	var count int64
 	for _, t := range ts {
-		if t.After(cutoff) || t.Equal(cutoff) {
+		if !t.Before(cutoff) {
 			count++
-		} else {
-			break
 		}
 	}
-	return int64(count)
+	return count
 }

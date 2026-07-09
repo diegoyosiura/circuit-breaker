@@ -1104,3 +1104,55 @@ ok scn27 0.053s
 - **Documentos:** CB.md de alta fidelidade (2 imprecisões, 5 menores); CB-TESTES.md consistente no núcleo, com 1 erro factual (§10, -count=1), 4 imprecisões concentradas no estado das erratas frente ao CB.md vigente e 8 menores.
 
 > **Nota desta edição:** todas as correções P0–P2 apontadas pela auditoria (§12.3) foram aplicadas a `CB.md` e a este documento nesta mesma edição; a §12.3 permanece como registro histórico do que a auditoria encontrou.
+
+---
+
+## 13. Validação de não-regressão da execução do plano (branch `refactor/optimizations`)
+
+> Após a execução integral do [`PLANO.md`](PLANO.md) (Fases 0, 1, 2, 3 e 5 — 12 commits), um workflow multiagente de não-regressão verificou **24 itens** em 5 frentes: estabilidade da suíte (×5 com `-race`, zero flakes), bugs corrigidos (os repros antigos **falham em reproduzir** os defeitos — race, corpo perdido, hang pós-Stop, custo crescente, busy-loop, backoff surdo), comportamentos preservados (tabela efetiva de retry, 5xx=sucesso, `failed>total`, get-or-create silencioso, burst 2×, ausência de fast-fail — todos **idênticos**), contrato congelado (módulo-sentinela externo compila; interfaces com exatamente 2 e 3 métodos; extensões puramente aditivas) e desempenho (3,2 µs/op vs 61 µs do baseline).
+
+### Veredito Final de Não-Regressão — branch `refactor/optimizations` (HEAD dd9c6ef)
+
+**Data:** 2026-07-09 · **Juiz:** consolidação final da campanha de validação · **Itens avaliados:** 24/24
+
+### Tabela consolidada
+
+| Item | Expectativa (resumo) | Resultado observado | Veredito |
+|---|---|---|---|
+| `build-vet` | `go build` e `go vet` limpos | BUILD_EXIT=0, VET_EXIT=0 | SEM_REGRESSAO |
+| `suite-x5` | 5x `go test -race` verdes, zero flakes | 5/5 ok, tempos estáveis (~1,0s/~7,0s), nenhum DATA RACE | SEM_REGRESSAO |
+| `suite-norace` | Suite sem `-race` passa | `ok pkg 5.805s`, exit 0 | SEM_REGRESSAO |
+| `bench` | `BenchmarkDo` ~3-5 µs/op (baseline antigo: 61 µs) | 3,24 µs serial, 4,62 µs paralelo, 11 allocs/op | SEM_REGRESSAO |
+| `race-metrics` | Zero DATA RACE no snapshot de `Metrics()` | 0 ocorrências em 4 execuções por teste; antes abortava sob `-race` | SEM_REGRESSAO |
+| `post-body` | Retry de POST reenvia corpo completo | Servidor viu `["PAYLOAD-123","PAYLOAD-123"]`; FAIL do repro antigo = bug sumiu | SEM_REGRESSAO |
+| `hang-pos-stop` | `Do()` pós-Stop retorna `ErrStopped` imediato | Retorno em ~10µs com texto exato; tokens residuais e idempotência de Stop preservados; FAIL do val-03 = bug sumiu | SEM_REGRESSAO |
+| `backoff-ctx` | Cancel a ~50ms interrompe backoff (<200ms) | `Do()` retornou em ~51ms com `context canceled`, 1 só chamada ao transport; FAIL do scn-08 = bug sumiu | SEM_REGRESSAO |
+| `custo-flat` | Custo por bloco estável ~2-6 µs/req, razão ~1x | Blocos 3,4-5,8 µs/req, razão 0,59-0,6x; `len(StartTimeRequests)=20` após 10k reqs | SEM_REGRESSAO |
+| `leak` | Slices do snapshot podados a ≤20 (mudança D4) | len=20 em endpoint e `::root`; contadores exatos (5000/5000); FAIL da asserção antiga = vazamento eliminado | SEM_REGRESSAO |
+| `busy-loop` | Construtor <100ms e CPU ociosa ~0 (antes 26s / 100%) | Construtor 13-14ms; CPU ociosa 4,1-4,2%; ambos os gates do bug falharam (NOT REPRODUCED) | SEM_REGRESSAO |
+| `tabela-retry` | Classificação retryable idêntica ao baseline (9 casos) | 9/9 idênticos; único FAIL é do palpite do teste (caso 7 wrap `%w`), medição = baseline | SEM_REGRESSAO |
+| `econnrefused` | ECONNREFUSED → 1 chamada; timeout → 6 chamadas, texto exato do erro | 3 variantes com 1 chamada cada; timeout 6 chamadas; `"request failed after retries"` byte a byte | SEM_REGRESSAO |
+| `5xx-sucesso` | HTTP 500 com err==nil conta como sucesso | Successful=1, Failed=0 no endpoint e `::root` | SEM_REGRESSAO |
+| `failed-gt-total` | Cancel na espera de token: Failed>Total (D3) | Failed=6 > Total=1, sem bloqueio (0,18s) | SEM_REGRESSAO |
+| `manager-silencioso` | Get-or-create silencioso reusa instância A | Identidade tripla confirmada; rate efetivo continua o de A (req2 bloqueou até deadline) | SEM_REGRESSAO |
+| `sem-fastfail` | Sem estado open: 11ª chamada atinge o transport | calls=11, Failed=11; nenhum curto-circuito | SEM_REGRESSAO |
+| `burst-2x` | Burst 1ª janela ~2x maxRequests [1,7-2,2x] | Razão exata 2,00x com 380 falhas por deadline (limite exercitado) | SEM_REGRESSAO |
+| `get-retry` | GET re-tenta e sucede na 3ª; Total=3/Success=1/Failed=2/Retry=2 | Métricas idênticas, 200 na 3ª tentativa | SEM_REGRESSAO |
+| `stop-idempotente` | 32 Stops concorrentes sem panic/deadlock/race | OK nos dois modos, `-race` limpo | SEM_REGRESSAO |
+| `modo-ilimitado` | Sem goroutine extra, Do pós-Stop funciona, Stop no-op | 3→3→3 goroutines, 5/5 com 200, duplo Stop ok; coerente com F3 (ErrStopped só com rate limit) | SEM_REGRESSAO |
+| `sentinela` | Contrato congelado exato prova por módulo externo | Assinaturas, interfaces (3+2 métodos) e 28 campos intactos; 29º campo é o aditivo | SEM_REGRESSAO |
+| `aditivo` | Novidades puramente aditivas | ErrStopped, ErrRetriesExhausted, IManagerLifecycle, IManagerStrict, TokenWaitCancellations — nada removido/alterado | SEM_REGRESSAO |
+| `json-tags` | `TestContract` do repo passa | PASS em 0,003s; tags JSON congeladas conferem | SEM_REGRESSAO |
+
+### Destaques
+
+1. **Semântica dos FAILs escrutinada item a item.** Todos os `--- FAIL` reportados (`post-body`/verify, `hang-pos-stop`/val-03, `backoff-ctx`/scn-08, `leak`/scn-04, `busy-loop`/scn-22) vêm de repros antigos escritos para *provar* o bug — a asserção dispara justamente quando o bug NÃO reproduz. A evidência bruta em cada um (corpo íntegro nas 2 tentativas, retorno em ~10µs, cancel em ~51ms, poda a 20 amostras com contadores exatos, construtor em 13ms) confirma que a falha decorre da ausência do bug, não de mudança em comportamento preservado. **Nenhum FAIL é regressão.**
+2. **Caso 7 de `tabela-retry` (wrap `%w`):** o FAIL é do palpite embutido no teste (previa retry); o comportamento medido — 1 chamada, não-retryable — é *idêntico ao baseline registrado*. Classificação de retryability 100% preservada (9/9).
+3. **Comportamentos preservados por decisão de projeto** — 5xx como sucesso, Failed>Total no cancel de token (D3), manager get-or-create silencioso, ausência de fast-fail, burst 2x na 1ª janela, tokens residuais consumíveis pós-Stop, texto exato `"request failed after retries"` — todos reproduzidos byte a byte.
+4. **Contrato congelado provado por três vias independentes:** `var _` de assinatura, implementações mínimas satisfazendo `ICircuitBreaker`/`IManager` (prova de que nenhum método foi adicionado) e reflexão + `TestContract` do próprio repo. Novidades (F3/F7/Fase 3, `TokenWaitCancellations`) são estritamente aditivas.
+5. **Ganhos confirmados sem custo comportamental:** ~19x em `BenchmarkDo` (61→3,2 µs/op), custo por request plano (razão 0,59x vs 7-8x antes), construtor ~2000x mais rápido, race do `Metrics()` eliminada.
+6. **Ressalva não-bloqueante (tuning, não regressão):** no cenário extremo de 2e9 tokens/s, o breaker ocioso consome ~4% de um core (vs ~100% antes; gates do bug em >=10% e >=100x não dispararam). Se o alvo futuro for residual <1% em configurações extremas, tratar como item de tuning do refiller.
+
+### Veredito final: **SEM_REGRESSAO** (confiança alta)
+
+Justificativa: 24/24 itens verificados com sucesso contra o código novo, incluindo suíte 5x verde sob `-race`, contrato de API congelado provado por módulos externos compilando sem ajustes, e todos os comportamentos preservados por decisão reproduzidos exatamente. Todos os FAILs observados foram analisados individualmente e correspondem a repros de bugs corrigidos (bug ausente = resultado desejado) ou a palpite incorreto de teste com medição idêntica ao baseline. Nenhum item central ficou inconclusivo; nenhuma mudança não-deliberada de comportamento foi detectada. As únicas mudanças de comportamento observadas (poda D4 a 20 amostras, `ErrStopped` pós-Stop, backoff sensível a contexto, corpo reenviado no retry) são exatamente as correções deliberadas da campanha.

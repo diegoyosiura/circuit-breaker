@@ -359,3 +359,36 @@ func TestRegression_ClampPreservesRefill(t *testing.T) {
 	// difícil de esgotar em teste; o essencial aqui é que o breaker funciona
 	// e o ticker existe com lote >1 (validado indiretamente pelo teste de CPU).
 }
+
+// Fase 2 [A4, cenário 05] — o custo por Do() é ESTÁVEL com o histórico:
+// razão bloco5/bloco1 ≤ 1,2 (era 7,3–8,6× no código antigo).
+func TestRegression_PerRequestCostFlat(t *testing.T) {
+	if testing.Short() || raceEnabled {
+		t.Skip("medição de custo (distorcida sob -race)")
+	}
+	cb := circuitbreaker.NewCircuitBreaker("fase2", 0, 0, 0, 0)
+	defer cb.Stop()
+	cl := &http.Client{Transport: &countingTransport{}}
+	req, _ := http.NewRequest(http.MethodGet, "http://fase2.test/x", nil)
+
+	const block = 2000
+	perBlock := make([]float64, 0, 5)
+	for b := range 5 {
+		start := time.Now()
+		for range block {
+			resp, err := cb.Do(req, cl)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			_ = resp.Body.Close()
+		}
+		us := float64(time.Since(start).Microseconds()) / block
+		perBlock = append(perBlock, us)
+		t.Logf("bloco %d: %.2f µs/req", b, us)
+	}
+	ratio := perBlock[4] / perBlock[0]
+	if ratio > 1.2 {
+		t.Fatalf("custo por request cresce com o histórico: bloco5/bloco1 = %.2fx (limite 1,2)", ratio)
+	}
+	t.Logf("razão bloco5/bloco1 = %.2fx", ratio)
+}

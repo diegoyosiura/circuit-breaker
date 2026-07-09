@@ -6,7 +6,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 )
@@ -38,7 +37,7 @@ type circuitBreaker struct {
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 
 	metricsMu sync.RWMutex
-	metrics   map[string]map[string]*EndpointMetrics
+	metrics   map[string]map[string]*endpointState
 }
 
 // NewCircuitBreaker initializes a new ICircuitBreaker instance with concurrency, rate, and retry controls.
@@ -271,6 +270,8 @@ func isRetryable(err error) bool {
 }
 
 // Metrics returns a snapshot of the aggregated metrics per host and endpoint.
+// Every field of the returned structs is a fresh copy — no aliasing with the
+// live state (CB.md A1).
 func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
 	cb.metricsMu.RLock()
 	defer cb.metricsMu.RUnlock()
@@ -278,20 +279,8 @@ func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
 	result := make(map[string]map[string]EndpointMetrics, len(cb.metrics))
 	for host, endpoints := range cb.metrics {
 		endpointCopy := make(map[string]EndpointMetrics, len(endpoints))
-		for endpoint, metrics := range endpoints {
-			snapshot := *metrics
-			// Deep-copy: sem isto os campos slice do snapshot compartilham
-			// backing array com os dados vivos (caller e breaker se corrompem
-			// mutuamente).
-			snapshot.TimeRequests = slices.Clone(metrics.TimeRequests)
-			snapshot.TimeSuccessfulRequests = slices.Clone(metrics.TimeSuccessfulRequests)
-			snapshot.TimeFailedRequests = slices.Clone(metrics.TimeFailedRequests)
-			snapshot.TimeRetry = slices.Clone(metrics.TimeRetry)
-			snapshot.StartTimeRequests = slices.Clone(metrics.StartTimeRequests)
-			snapshot.StartTimeSuccessfulRequests = slices.Clone(metrics.StartTimeSuccessfulRequests)
-			snapshot.StartTimeFailedRequests = slices.Clone(metrics.StartTimeFailedRequests)
-			snapshot.StartTimeRetry = slices.Clone(metrics.StartTimeRetry)
-			endpointCopy[endpoint] = snapshot
+		for endpoint, state := range endpoints {
+			endpointCopy[endpoint] = state.snapshot()
 		}
 		result[host] = endpointCopy
 	}
@@ -300,164 +289,59 @@ func (cb *circuitBreaker) Metrics() map[string]map[string]EndpointMetrics {
 }
 
 func (cb *circuitBreaker) recordAttempt(host, endpoint string, start, end time.Time) {
-	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
-		m.TotalRequests++
-		m.TimeRequests = append(m.TimeRequests, end.Sub(start).Seconds())
-		m.StartTimeRequests = append(m.StartTimeRequests, start)
-		m.MeanRequests, _ = avgLastNItens(m.TimeRequests, 20)
-
-		m.Ratio01Requests = repsRatio(m.StartTimeRequests, 1)
-		m.Ratio05Requests = repsRatio(m.StartTimeRequests, 5)
-		m.Ratio10Requests = repsRatio(m.StartTimeRequests, 10)
+	cb.updateMetrics(host, endpoint, func(s *endpointState) {
+		s.totalRequests++
+		s.req.record(start, end)
 	})
 }
 
 func (cb *circuitBreaker) recordSuccess(host, endpoint string, start, end time.Time) {
-	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
-		m.SuccessfulRequests++
-		m.TimeSuccessfulRequests = append(m.TimeSuccessfulRequests, end.Sub(start).Seconds())
-		m.StartTimeSuccessfulRequests = append(m.StartTimeSuccessfulRequests, start)
-		m.MeanSuccessfulRequests, _ = avgLastNItens(m.TimeSuccessfulRequests, 20)
-
-		m.Ratio01SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 1)
-		m.Ratio05SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 5)
-		m.Ratio10SuccessfulRequests = repsRatio(m.StartTimeSuccessfulRequests, 10)
+	cb.updateMetrics(host, endpoint, func(s *endpointState) {
+		s.successfulRequests++
+		s.success.record(start, end)
 	})
 }
 
 func (cb *circuitBreaker) recordFailure(host, endpoint string, start, end time.Time) {
-	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
-		m.FailedRequests++
-		m.TimeFailedRequests = append(m.TimeFailedRequests, end.Sub(start).Seconds())
-		m.StartTimeFailedRequests = append(m.StartTimeFailedRequests, start)
-		m.MeanFailedRequests, _ = avgLastNItens(m.TimeFailedRequests, 20)
-
-		m.Ratio01FailedRequests = repsRatio(m.StartTimeFailedRequests, 1)
-		m.Ratio05FailedRequests = repsRatio(m.StartTimeFailedRequests, 5)
-		m.Ratio10FailedRequests = repsRatio(m.StartTimeFailedRequests, 10)
+	cb.updateMetrics(host, endpoint, func(s *endpointState) {
+		s.failedRequests++
+		s.failure.record(start, end)
 	})
 }
 
 func (cb *circuitBreaker) recordRetry(host, endpoint string, start, end time.Time) {
-	cb.updateMetrics(host, endpoint, func(m *EndpointMetrics) {
-		m.RetryCount++
-		m.TimeRetry = append(m.TimeRetry, end.Sub(start).Seconds())
-		m.StartTimeRetry = append(m.StartTimeRetry, start)
-		m.MeanRetry, _ = avgLastNItens(m.TimeRetry, 20)
-
-		m.Ratio01Retry = repsRatio(m.StartTimeRetry, 1)
-		m.Ratio05Retry = repsRatio(m.StartTimeRetry, 5)
-		m.Ratio10Retry = repsRatio(m.StartTimeRetry, 10)
+	cb.updateMetrics(host, endpoint, func(s *endpointState) {
+		s.retryCount++
+		s.retry.record(start, end)
 	})
 }
 
-func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*EndpointMetrics)) {
+// updateMetrics applies the update to the endpoint state AND to the per-host
+// "::root" aggregate, under the metrics lock. Each record is O(1): ring
+// buffers for the means and a fixed bucket wheel for the window counts
+// (metrics_state.go) — the previous slices grew without bound and made every
+// Do() progressively slower (CB.md A4).
+func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*endpointState)) {
 	cb.metricsMu.Lock()
 	defer cb.metricsMu.Unlock()
 
 	if cb.metrics == nil {
-		cb.metrics = make(map[string]map[string]*EndpointMetrics)
+		cb.metrics = make(map[string]map[string]*endpointState)
 	}
 
 	hostMetrics, ok := cb.metrics[host]
 	if !ok {
-		hostMetrics = make(map[string]*EndpointMetrics)
+		hostMetrics = make(map[string]*endpointState)
 		cb.metrics[host] = hostMetrics
-		cb.metrics[host]["::root"] = &EndpointMetrics{}
+		hostMetrics["::root"] = &endpointState{}
 	}
 
-	endpointMetrics, ok := hostMetrics[endpoint]
+	state, ok := hostMetrics[endpoint]
 	if !ok {
-		endpointMetrics = &EndpointMetrics{}
-		hostMetrics[endpoint] = endpointMetrics
+		state = &endpointState{}
+		hostMetrics[endpoint] = state
 	}
 
-	updateFn(endpointMetrics)
-	updateFn(cb.metrics[host]["::root"])
-	pruneMetrics(endpointMetrics)
-	pruneMetrics(cb.metrics[host]["::root"])
-}
-
-// Retenção das amostras internas (F4/D4): as médias usam as últimas
-// meanWindow amostras e os ratios a janela de até 10 min — nada além disso
-// precisa ser retido. Antes desta poda os slices cresciam sem teto (leak de
-// memória + custo O(n) por request, CB.md A4).
-const (
-	meanWindow    = 20               // amostras usadas por avgLastNItens
-	pruneTrigger  = 4 * meanWindow   // amortiza a cópia da poda
-	ratioWindow   = 10 * time.Minute // maior janela de repsRatio
-	startsHardCap = 100_000          // teto absoluto de segurança
-)
-
-func pruneMetrics(m *EndpointMetrics) {
-	m.TimeRequests = pruneFloats(m.TimeRequests)
-	m.TimeSuccessfulRequests = pruneFloats(m.TimeSuccessfulRequests)
-	m.TimeFailedRequests = pruneFloats(m.TimeFailedRequests)
-	m.TimeRetry = pruneFloats(m.TimeRetry)
-
-	cutoff := time.Now().Add(-ratioWindow)
-	m.StartTimeRequests = pruneTimes(m.StartTimeRequests, cutoff)
-	m.StartTimeSuccessfulRequests = pruneTimes(m.StartTimeSuccessfulRequests, cutoff)
-	m.StartTimeFailedRequests = pruneTimes(m.StartTimeFailedRequests, cutoff)
-	m.StartTimeRetry = pruneTimes(m.StartTimeRetry, cutoff)
-}
-
-func pruneFloats(xs []float64) []float64 {
-	if len(xs) <= pruneTrigger {
-		return xs
-	}
-	out := make([]float64, meanWindow)
-	copy(out, xs[len(xs)-meanWindow:])
-	return out
-}
-
-func pruneTimes(ts []time.Time, cutoff time.Time) []time.Time {
-	if len(ts) > startsHardCap {
-		ts = ts[len(ts)-startsHardCap:]
-	}
-	// Entradas são cronológicas (pós-F1 nada reordena): descarta o prefixo
-	// fora da janela, copiando apenas quando ao menos metade expirou.
-	expired := 0
-	for expired < len(ts) && ts[expired].Before(cutoff) {
-		expired++
-	}
-	if expired == 0 || expired < len(ts)/2 {
-		return ts
-	}
-	out := make([]time.Time, len(ts)-expired)
-	copy(out, ts[expired:])
-	return out
-}
-
-func avgLastNItens(xs []float64, size int) (avg float64, count int) {
-	if len(xs) == 0 {
-		return 0, 0
-	}
-	start := 0
-	if len(xs) > size {
-		start = len(xs) - size
-	}
-	sum := 0.0
-	for _, v := range xs[start:] {
-		sum += v
-	}
-	count = len(xs) - start
-	return sum / float64(count), count
-}
-
-// repsRatio counts how many timestamps fall inside the trailing window.
-// It must NOT mutate ts: the slices are shared with snapshots returned by
-// Metrics(), and the previous in-place sort caused a data race (CB.md A1).
-func repsRatio(ts []time.Time, windowMinutes int) int64 {
-	if len(ts) == 0 || windowMinutes <= 0 {
-		return 0
-	}
-	cutoff := time.Now().Add(-time.Duration(windowMinutes) * time.Minute)
-	var count int64
-	for _, t := range ts {
-		if !t.Before(cutoff) {
-			count++
-		}
-	}
-	return count
+	updateFn(state)
+	updateFn(hostMetrics["::root"])
 }

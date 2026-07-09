@@ -1156,3 +1156,92 @@ ok scn27 0.053s
 ### Veredito final: **SEM_REGRESSAO** (confiança alta)
 
 Justificativa: 24/24 itens verificados com sucesso contra o código novo, incluindo suíte 5x verde sob `-race`, contrato de API congelado provado por módulos externos compilando sem ajustes, e todos os comportamentos preservados por decisão reproduzidos exatamente. Todos os FAILs observados foram analisados individualmente e correspondem a repros de bugs corrigidos (bug ausente = resultado desejado) ou a palpite incorreto de teste com medição idêntica ao baseline. Nenhum item central ficou inconclusivo; nenhuma mudança não-deliberada de comportamento foi detectada. As únicas mudanças de comportamento observadas (poda D4 a 20 amostras, `ErrStopped` pós-Stop, backoff sensível a contexto, corpo reenviado no retry) são exatamente as correções deliberadas da campanha.
+
+---
+
+## 14. Matriz de 50 configurações — validação da Fase 4 e das estatísticas
+
+> Após a implementação integral do plano (incl. Fase 4 opt-in, pacote raiz e tuning do tick), um workflow multiagente executou **50 configurações distintas** (10 executores × 5 configs, todas sob `-race`): clássicas (semáforo, bucket, retries, starvation), manager (get-or-create/strict/lifecycle/concorrente), Fase 4 (abre/fecha/reabre, 5xx, políticas, backoff exponencial, defaultTimeout, inércia), edge (configs degeneradas 1e6/2e9, dois hosts, corpo não-rebobinável) e import via pacote raiz. Cada config assevera as **estatísticas observadas contra o modelo semântico M1–M15** (contadores, `::root`=soma, ratios=contagens, means, `len≤20`, burst/taxa sustentada, fast-fail sem tocar transport/métricas). **Resultado: 50/50 OK, 0 erros, 0 inconclusivos, zero data races/panics/deadlocks.** Destaques: a config 10 bateu a previsão teórica exata do bucket (15 = 10 burst + 5 refills de 200 ms); a 48 tirou 30.911 snapshots concorrentes com tráfego sem uma única race; a 45 construiu o breaker degenerado (2e9) em 78 ms.
+
+# Julgamento da matriz de 50 configurações — circuit-breaker
+
+### Veredito consolidado: CONFORME
+
+50/50 configurações passaram sob `-race` com evidência numérica concreta. Zero DATA RACE, zero panic, zero deadlock em ~30 execuções distribuídas pelos 10 batches (batches com `-count` de 1 a 5). Nenhum resultado ERRO ou INCONCLUSIVO foi reportado pelos executores.
+
+### Tabela das 50 configurações
+
+| id | Veredito | Observação-chave |
+|----|----------|------------------|
+| 01 | OK | M6/M7/M9: ::root=30 é soma exata de /a(10)+/b(20); ring de 20 amostras respeitado com 30 eventos |
+| 02 | OK | 15/15 sucesso sequencial com maxConcurrent=1; mean_successful=0.000020s dentro de M8 |
+| 03 | OK | M1: retry conta em total (total=4 para 3 chamadas, 1 retentada); 1 backoff de 500ms exato |
+| 04 | OK | M13 integral: texto "request failed after retries" byte a byte, errors.Is/As na cadeia completa |
+| 05 | OK | M10: erro genérico não retentado — 1 chamada apesar de maxRetries=5, retorno em 97µs |
+| 06 | OK | GetBody rebobinou o corpo: transport viu "PAYLOAD-XYZ" completo nas 2 tentativas |
+| 07 | OK | M2: sem WithStatusCodeFailure, 3×500 contam como success=3, failed=0 |
+| 08 | OK | M3/M5: failed(4) > total(1) — 4 cancelamentos na espera por token sem tocar transport |
+| 09 | OK | M15: pico em voo == 3 exato (semáforo 3, 30 goroutines), estável em 4 execuções |
+| 10 | OK | M11 exato: successes=15 = burst 10 + 5 refills; failed==token_wait_cancellations==190 |
+| 11 | OK | Janela 1: 39 sucessos (~burst+refill); janela 2: 21 ≈ taxa sustentada 20/s |
+| 12 | OK | M14: sobras do bucket atendem pós-Stop; 3ª Do → ErrStopped; Stop() 2× sem panic (nota abaixo) |
+| 13 | OK | Modo ilimitado (0,0,0,0): zero goroutines de ticker criadas; 50/50 ok; Stop() no-op |
+| 14 | OK | (1,5,1,0) sequencial: nenhuma interferência de semáforo/bucket, 5/5 ok |
+| 15 | OK | M10: ECONNREFUSED não retentado — 1 chamada, retorno em 73µs, sentinela via errors.Is |
+| 16 | OK | M10 sutil: net.Error embrulhado em fmt.Errorf NÃO é retryable (type assertion direta em url.Error.Err) |
+| 17 | OK | Timeout retryable: 2 chamadas (1+1 retry), backoff 500ms, M13 completo |
+| 18 | OK | mean_successful=0.05s explicado: amostra inclui espera por token (2 reqs × 250ms / 10) |
+| 19 | OK | R1: Client nil → http.DefaultClient sem panic, contra servidor httptest real |
+| 20 | OK | M3/M5: deadline na espera por token → failed=1, cancels=1, total=3 (sem incremento) |
+| 21 | OK | Manager: 2ª chamada com params diferentes devolve MESMA instância; prova comportamental (deadline 150ms) |
+| 22 | OK | Strict: config divergente → erro descritivo + cb==nil; instância e registro originais intactos |
+| 23 | OK | Lifecycle: List ordenado, Remove idempotente, Remove de inexistente não panica |
+| 24 | OK | StopAll 2× idempotente (M14); registro preservado; sobras atendem, depois ErrStopped |
+| 25 | OK | 50 goroutines simultâneas em NewCircuitBreaker: 1 única instância, zero race em 6 execuções |
+| 26 | OK | M12: fast-fail ErrCircuitOpen antes de semáforo/token/métricas — contadores congelados |
+| 27 | OK | open → half-open (após openFor) → closed em sonda com sucesso |
+| 28 | OK | half-open → open em sonda falha, com rearme do openedAt |
+| 29 | OK | threshold=1: uma única falha abre o circuito |
+| 30 | OK | Sucesso zera consecFails: alternância falha/ok nunca abre com threshold=2 |
+| 31 | OK | M2: WithStatusCodeFailure(500) → failed=3 mas resposta devolvida com err==nil, sem retry |
+| 32 | OK | 404 com limiar 400 → failed=1, resposta entregue ao chamador |
+| 33 | OK | 499 < limiar 500 → conta como sucesso; fronteira exata do limiar respeitada |
+| 34 | OK | Status-failure alimenta o breaker: 2×500 abrem circuito; fast-fail não toca transport |
+| 35 | OK | WithRetryPolicy custom retenta ECONNREFUSED (que o default não retenta); M13 completo |
+| 36 | OK | WithRetryPolicy(false) suprime retry mesmo de net.Error Timeout; erro da tentativa devolvido direto |
+| 37 | OK | Backoff exponencial sem jitter: esperas 10+20+40ms confirmadas nos StartTimeRequests |
+| 38 | OK | Jitter dentro do intervalo teórico [15,30]ms; estável em 5 repetições |
+| 39 | OK | WithDefaultTimeout(60ms) manda sem deadline do chamador; causa DeadlineExceeded via Unwrap (nota abaixo) |
+| 40 | OK | Deadline do chamador (25ms) vence o default (60ms) — 25.4ms medidos |
+| 41 | OK | Import raiz: tipos intercambiáveis com /pkg em compile-time e runtime |
+| 42 | OK | Sentinela ErrCircuitOpen idêntico entre raiz e /pkg (errors.Is cruzado true) |
+| 43 | OK | NewManager raiz: interfaces idênticas via alias; StopAll idempotente; ErrStopped igual nos dois caminhos |
+| 44 | OK | Pré-fill de 1e6 tokens em 82ms (<1s, limite do clamp M11) |
+| 45 | OK | maxRequests=2e9 clampado em 1e6; construtor em 78ms; 10/10 ok com deadline de 5ms |
+| 46 | OK | ctx cancela o backoff de 500ms em ~50ms (select ctx.Done vs time.After); retry=1 agendado, M5=0 |
+| 47 | OK | M12 inércia: sem WithBreaker, 5 falhas consecutivas não abrem circuito (StateDisabled) |
+| 48 | OK | 30.911 snapshots concorrentes de Metrics() iterando slices: zero race — cópia sem aliasing; doCount=65 bate M11 exato |
+| 49 | OK | M6 multi-host: ::root de cada host soma só os endpoints daquele host (sem vazamento entre hosts) |
+| 50 | OK | M10/D2: corpo não-rebobinável (GetBody==nil) impede retry mesmo com erro retryable e maxRetries=4; retry_count=0 |
+
+### Erros e divergências
+
+**Nenhum erro de produto encontrado.** Duas divergências menores foram escrutinadas e descartadas como defeito:
+
+1. **cfg12 — lacuna documental em M3, não defeito**: `Do` que retorna `ErrStopped` incrementa `failed_requests` (failed=1 sem incrementar total). Verifiquei `pkg/circuitbreaker.go:216-225`: `recordFailure` é chamado para qualquer erro de `waitForToken`, e apenas o contador de `token_wait_cancellations` exclui `ErrStopped` (linha 222). O comentário no código (linhas 217-220) declara essa semântica intencional (D3/R4). M3 enumera as fontes de failed sem citar ErrStopped — recomendação: atualizar o texto de M3 no modelo, sem mudança de código.
+2. **cfg39 — comportamento coerente, não defeito**: com `maxRetries=0` e timeout via `WithDefaultTimeout`, o erro externo é `retriesExhaustedError` (porque `url.Error.Timeout()==true` classifica como retryable e o loop exaure em zero tentativas restantes), mas `errors.Is(err, context.DeadlineExceeded)==true` via Unwrap, exatamente o que a config exigia.
+
+**Nota de cobertura**: a lista de batches de races omite a linha do batch3 (cfgs 11-15), mas cada um desses 5 resultados declara individualmente "PASS com -race" — a evidência existe inline e não compromete a conclusão.
+
+### Conclusão sobre a conformidade das estatísticas
+
+As estatísticas do circuit-breaker estão **conformes ao modelo semântico M1-M15** em todos os pontos exercitados:
+
+- **Contadores (M1-M5)**: total conta tentativas (retries inclusos), cancelamentos em espera por token incrementam failed e token_wait_cancellations sem incrementar total (failed > total demonstrado em cfg08/cfg10/cfg20), cancelamento em backoff não conta em M5 (cfg46).
+- **Agregação (M6)**: ::root é soma exata dos endpoints por host, sem vazamento entre hosts (cfg01, cfg49).
+- **Ratios (M7)** e **médias (M8)**: iguais aos contadores em janela curta; a única média não-trivial (cfg18, 0.05s) foi explicada pelo início da amostra antes de waitForToken.
+- **Rings (M9)**: todas as slices Time*/StartTime* limitadas a 20 amostras, mesmo com 30-65 eventos.
+- **Retry/erros (M10, M13, D2)**: classificação de retryabilidade, texto congelado do sentinela e cadeias de Unwrap verificados byte a byte; corpo não-rebobinável bloqueia retry.
+- **Bucket (M11)**: burst inicial + taxa de refill bateram nas previsões teóricas exatas (cfg10: 15; cfg48: 65); clamp de 1e6 funciona (cfg44/45).
+- **Breaker (M12)**: máquina de estados completa (closed→open→half-open→closed/open), fast-fail sem tocar transport nem métricas, inércia sem WithBreaker.
+- **Lifecycle (M14)** e **concorrência (M15, M9 sob leitura concorrente)**: Stop/StopAll idempotentes, manager thread-safe, snapshots de métricas sem aliasing — zero races em todas as execuções.

@@ -40,6 +40,9 @@ jobs:
         go tool cover -func=coverage.out | awk '/^total:/ {print "coverage: " $3}'
         go tool cover -html=coverage.out -o coverage.html
 
+    - name: Benchmarks (informativo)
+      run: go test -count=1 -run XXX -bench BenchmarkDo -benchtime 2000x ./pkg/
+
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:

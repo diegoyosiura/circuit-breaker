@@ -3,6 +3,7 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -10,6 +11,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+)
+
+// Limites de sanidade do token bucket (F5/D5 do PLANO.md).
+const (
+	minTokenInterval  = time.Millisecond // piso do intervalo do ticker
+	maxBucketCapacity = 1_000_000        // teto do burst para configs degeneradas
 )
 
 // circuitBreaker implements a resilient HTTP request handler with the following features:
@@ -23,7 +30,8 @@ type circuitBreaker struct {
 	MaxRetries    int           // Number of retry attempts allowed for retryable failures
 	sem           chan struct{} // Semaphore to control concurrent request slots
 	tokens        chan struct{} // Token bucket channel to regulate request rate
-	tokenInterval time.Duration // Interval between tokens being added to the bucket
+	tokenInterval time.Duration // Interval between refill ticks
+	tokensPerTick int           // Tokens restored per tick (>1 when the interval is clamped)
 	tokenStop     chan struct{} // Channel to signal shutdown of the token generator
 
 	backoff time.Duration // Delay between retry attempts (default 500ms)
@@ -54,10 +62,26 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 	}
 
 	if maxRequests > 0 && windowSeconds > 0 {
-		cb.tokens = make(chan struct{}, maxRequests)
+		// Teto de capacidade para configs degeneradas: sem ele, maxRequests
+		// gigante custa dezenas de segundos de pré-fill no construtor e anula
+		// o rate limit na prática (CB.md A16). Configs sãs não são afetadas.
+		capacity := maxRequests
+		if capacity > maxBucketCapacity {
+			capacity = maxBucketCapacity
+		}
+		cb.tokens = make(chan struct{}, capacity)
+
 		interval := (time.Duration(windowSeconds) * time.Second) / time.Duration(maxRequests)
-		if interval <= 0 {
-			interval = time.Nanosecond
+		cb.tokensPerTick = 1
+		if interval < minTokenInterval {
+			// Piso de 1ms com reposição em lote: preserva a taxa nominal sem
+			// transformar o ticker num busy-loop de ~1 core (CB.md A16).
+			perSecond := float64(maxRequests) / float64(windowSeconds)
+			cb.tokensPerTick = int(math.Ceil(perSecond * minTokenInterval.Seconds()))
+			if cb.tokensPerTick > capacity {
+				cb.tokensPerTick = capacity // nunca repõe mais que o bucket comporta
+			}
+			interval = minTokenInterval
 		}
 		cb.tokenInterval = interval
 		cb.tokenStop = make(chan struct{})
@@ -90,10 +114,16 @@ func (cb *circuitBreaker) startTokenBucket() {
 			case <-cb.tokenStop:
 				return // Stop signal received
 			case <-ticker.C:
-				select {
-				case cb.tokens <- struct{}{}:
-				default:
-					// Token bucket is full; drop the token (non-blocking)
+			refill:
+				for range cb.tokensPerTick {
+					select {
+					case cb.tokens <- struct{}{}:
+					default:
+						// Bucket cheio: nada mais a repor neste tick — sem o
+						// break rotulado, um lote grande viraria milhões de
+						// sends falhos por tick (busy-loop disfarçado).
+						break refill
+					}
 				}
 			}
 		}
@@ -161,10 +191,16 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 			return nil, err
 		}
 
-		// If retries remain, back off slightly before trying again
+		// If retries remain, back off slightly before trying again.
+		// The wait observes the request context: a cancelled caller returns
+		// immediately instead of sleeping through the backoff (CB.md A6).
 		if attempt < cb.MaxRetries {
 			cb.recordRetry(host, endpoint, start, time.Now())
-			time.Sleep(cb.backoff)
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(cb.backoff):
+			}
 		}
 	}
 

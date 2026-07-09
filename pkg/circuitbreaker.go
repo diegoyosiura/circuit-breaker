@@ -26,6 +26,8 @@ type circuitBreaker struct {
 	tokenInterval time.Duration // Interval between tokens being added to the bucket
 	tokenStop     chan struct{} // Channel to signal shutdown of the token generator
 
+	backoff time.Duration // Delay between retry attempts (default 500ms)
+
 	tokenWaitGroup sync.WaitGroup // WaitGroup to ensure graceful token goroutine shutdown
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 
@@ -44,6 +46,7 @@ func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 		Name:          name,
 		MaxConcurrent: maxConcurrent,
 		MaxRetries:    maxRetries,
+		backoff:       500 * time.Millisecond,
 	}
 
 	if maxConcurrent > 0 {
@@ -145,7 +148,7 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (*http.Response
 		// If retries remain, back off slightly before trying again
 		if attempt < cb.MaxRetries {
 			cb.recordRetry(host, endpoint, start, time.Now())
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(cb.backoff)
 		}
 	}
 

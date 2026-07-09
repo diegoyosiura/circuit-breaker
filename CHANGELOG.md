@@ -80,6 +80,24 @@ open/half-open opt-in — permanece como decisão de negócio futura).
 | Construtor `maxRequests=2e9` | ~26 s | **<100 ms** |
 | CPU ociosa (config extrema) | ~100% de 1 core | **~0** |
 
+### Fase 4 — circuit breaker de verdade (opt-in, inerte por default)
+
+- `NewCircuitBreakerWithOptions` + opções: `WithBreaker` (estados
+  closed/open/half-open, fast-fail com `ErrCircuitOpen` sem tocar o
+  downstream, sondas limitadas em half-open), `WithStatusCodeFailure`
+  (5xx→falha nas métricas e no breaker; resposta ainda devolvida),
+  `WithRetryPolicy` (substitui a classificação default), `WithExponentialBackoff`
+  (base·2ⁿ com jitter), `WithDefaultTimeout` (teto só quando o chamador não
+  definiu nenhum). Sem opções: comportamento byte a byte idêntico ao clássico
+  (teste de inércia). Cancelamentos locais são neutros para o breaker.
+- `StateReporter`/`BreakerState` (interface opcional) e `ErrCircuitOpen`.
+- **Pacote raiz com aliases**: `import "github.com/diegoyosiura/circuit-breaker"`
+  passa a funcionar sem alias manual; o path `/pkg` continua válido e os
+  tipos são idênticos (type aliases).
+- **Tuning do tick clampado** (ressalva da validação): 25ms com lote →
+  CPU ociosa em config degenerada de ~4% para **0,55%** de um core;
+  construtor ~13ms. *Bucket lazy avaliado e adiado (condição do plano).*
+
 ### Infra
 
 - FakeServer (`internal/`): porta 0 = efêmera (N servidores simultâneos),

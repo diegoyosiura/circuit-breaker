@@ -21,6 +21,13 @@ Cliente HTTP resiliente, sem dependências externas (só stdlib), que compõe tr
 go get github.com/diegoyosiura/circuit-breaker
 ```
 
+Dois imports equivalentes (os tipos são aliases idênticos):
+
+```go
+import circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg" // histórico
+import "github.com/diegoyosiura/circuit-breaker"                    // raiz, sem alias
+```
+
 ## Uso
 
 ```go
@@ -127,6 +134,34 @@ if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
 | `mean_requests` | Média das últimas 20 esperas por token (s) |
 | `mean_successful_requests` | Média das últimas 20 durações espera+round-trip (s) |
 | `ratio_01/05/10_*` | Contagem de eventos nos últimos 1/5/10 minutos (calculada no registro) |
+
+## Circuit breaker de verdade (opt-in)
+
+A máquina de estados *closed/open/half-open* e as demais políticas são **opt-in** via `NewCircuitBreakerWithOptions` — sem opções, o comportamento é byte a byte idêntico ao clássico (provado por teste):
+
+```go
+cb := circuitbreaker.NewCircuitBreakerWithOptions("minha-api", 50, 200, 30, 3,
+	// abre após 5 falhas consecutivas; fast-fail (ErrCircuitOpen) por 30s;
+	// depois 2 sondas simultâneas — sucesso fecha, falha reabre
+	circuitbreaker.WithBreaker(5, 30*time.Second, 2),
+	// 5xx conta como falha nas métricas e no breaker (resposta ainda é devolvida)
+	circuitbreaker.WithStatusCodeFailure(500),
+	// backoff exponencial 100ms→5s com jitter (default: 500ms fixo)
+	circuitbreaker.WithExponentialBackoff(100*time.Millisecond, 5*time.Second, true),
+	// teto de duração APENAS quando o chamador não definiu client Timeout nem deadline
+	circuitbreaker.WithDefaultTimeout(15*time.Second),
+)
+
+resp, err := cb.Do(req, cl)
+if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+	// circuito aberto: acione o fallback — o downstream nem foi tocado
+}
+if sr, ok := cb.(circuitbreaker.StateReporter); ok {
+	fmt.Println("estado:", sr.State()) // closed / open / half-open / disabled
+}
+```
+
+`WithRetryPolicy(fn)` substitui a classificação de retry padrão (ex.: para retentar `ECONNREFUSED`, que o default deliberadamente não retenta). Cancelamentos locais (contexto expirado esperando token/backoff) são **neutros** para o breaker — só falhas do downstream abrem o circuito.
 
 ## Política de compatibilidade
 

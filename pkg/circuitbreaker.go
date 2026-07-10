@@ -282,7 +282,9 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 		// vale para chamadas novas e para retries.
 		if err := cb.waitRetryAfterGate(req.Context()); err != nil {
 			cb.recordFailure(host, endpoint, start, time.Now())
-			cb.recordTokenCancel(host, endpoint)
+			if !errors.Is(err, ErrStopped) { // espelha o caminho do token
+				cb.recordTokenCancel(host, endpoint)
+			}
 			return nil, err
 		}
 		if err := cb.waitForToken(req.Context()); err != nil {
@@ -338,10 +340,17 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 					if attempt < cb.MaxRetries && (req.Body == nil || req.GetBody != nil) {
 						drainAndClose(resp)
 						cb.recordRetry(host, endpoint, start, time.Now())
+						// Piso de backoff: "Retry-After: 0" (ou data no
+						// passado) não pode virar marteladas imediatas na
+						// API que acabou de pedir pausa [hunt RA-04].
+						wait := time.Until(until)
+						if floor := cb.backoffFor(attempt); wait < floor {
+							wait = floor
+						}
 						select {
 						case <-req.Context().Done():
 							return nil, req.Context().Err()
-						case <-time.After(time.Until(until)):
+						case <-time.After(wait):
 						}
 						continue
 					}
@@ -402,6 +411,13 @@ func parseRetryAfter(h string, now time.Time) (time.Duration, bool) {
 		if secs < 0 {
 			return 0, false
 		}
+		// Satura ANTES de multiplicar: um header hostil/bugado gigante
+		// (ex.: "10000000000") estouraria o int64 para NEGATIVO, escapando
+		// do clamp e desarmando o gate — a proteção anti-bloqueio falharia
+		// aberta exatamente sob o sinal de bloqueio [hunt AB-01].
+		if int64(secs) > int64(math.MaxInt64)/int64(time.Second) {
+			return time.Duration(math.MaxInt64), true
+		}
 		return time.Duration(secs) * time.Second, true
 	}
 	if t, err := http.ParseTime(h); err == nil {
@@ -428,20 +444,29 @@ func (cb *circuitBreaker) extendRetryAfterGate(until time.Time) {
 	}
 }
 
-// waitRetryAfterGate bloqueia (respeitando ctx) enquanto o gate estiver ativo.
+// waitRetryAfterGate bloqueia (respeitando ctx e Stop) enquanto o gate
+// estiver ativo. O laço RE-CHECA o gate ao acordar: outra resposta 429/503
+// pode tê-lo estendido durante o sono — sem o loop, chamadas atravessariam
+// a pausa estendida [hunt AB-02]. Stop() desbloqueia via tokenStop quando o
+// breaker tem rate limit (canal nil nunca dispara no select; sem rate limit,
+// a espera é limitada por retryAfterMax) [hunt RA-03].
 func (cb *circuitBreaker) waitRetryAfterGate(ctx context.Context) error {
 	if cb.retryAfterMax <= 0 {
 		return nil
 	}
-	d := time.Until(time.Unix(0, cb.retryAfterUntil.Load()))
-	if d <= 0 {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d):
-		return nil
+	for {
+		d := time.Until(time.Unix(0, cb.retryAfterUntil.Load()))
+		if d <= 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-cb.tokenStop:
+			return ErrStopped
+		case <-time.After(d):
+			// volta ao topo: o gate pode ter sido estendido enquanto dormia
+		}
 	}
 }
 

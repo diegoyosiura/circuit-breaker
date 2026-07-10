@@ -44,6 +44,12 @@ type BreakerSpec struct {
 //
 // Função ADITIVA de pacote — IManager permanece congelada. Aceita apenas o
 // manager deste pacote (criado por NewManager).
+//
+// Notas operacionais: instâncias já registradas são devolvidas COMO ESTÃO —
+// inclusive se já paradas via Stop/StopAll (use IManagerLifecycle.Remove
+// antes de reconfigurar). A criação ocorre sob o lock do manager; o custo é
+// de milissegundos por spec (pré-fill do bucket limitado pelo teto de
+// capacidade), então chame na inicialização, não no hot path.
 func ConfigureManager(m IManager, specs map[string]BreakerSpec) (map[string]ICircuitBreaker, error) {
 	mgr, ok := m.(*manager)
 	if !ok {
@@ -62,6 +68,13 @@ func ConfigureManager(m IManager, specs map[string]BreakerSpec) (map[string]ICir
 	// Fase 1: valida tudo antes de criar qualquer coisa.
 	for _, name := range names {
 		spec := specs[name]
+		// Rate limit exige o PAR (MaxRequests, WindowSeconds): um sem o
+		// outro desligaria o limite silenciosamente [hunt AB-03].
+		if (spec.MaxRequests > 0) != (spec.WindowSeconds > 0) {
+			return nil, fmt.Errorf(
+				"circuitbreaker: spec %q inconsistente: MaxRequests=%d com WindowSeconds=%d (o rate limit ficaria desligado; defina ambos ou nenhum)",
+				name, spec.MaxRequests, spec.WindowSeconds)
+		}
 		want := breakerConfig{spec.MaxConcurrent, spec.MaxRequests, spec.WindowSeconds, spec.MaxRetries}
 		if _, exists := mgr.cb[name]; exists {
 			if got := mgr.cfg[name]; got != want {

@@ -147,6 +147,23 @@ Tudo aditivo; sem opções novas, comportamento byte a byte inalterado.
   `ratio_01_failed`); teste de integração da receita
   (TestRecipe_EmergencyBrakeAndGoldenMetrics).
 
+### Corrigido (caça focada no kit — 10 achados confirmados, 0 refutados)
+
+- `parseRetryAfter` satura em vez de estourar int64: header hostil gigante
+  ("10000000000") gerava delay NEGATIVO que desarmava o gate e disparava
+  retries imediatos — a proteção falhava aberta sob o sinal de bloqueio.
+- `waitRetryAfterGate` re-checa o gate em loop: extensão por resposta 429
+  em voo durante o sono era ignorada e chamadas atravessavam a pausa.
+- `Stop()` desbloqueia chamadas presas no gate (via tokenStop), com
+  contabilidade de ErrStopped espelhando o caminho do token.
+- Piso de backoff no retry pós-429: `Retry-After: 0`/data no passado não
+  vira martelada imediata.
+- `ConfigureManager` rejeita spec com rate limit incompleto (MaxRequests
+  sem WindowSeconds ou vice-versa) na fase de validação (tudo-ou-nada).
+- Docs: TokenWaitCancellations cobre a espera do gate; notas operacionais
+  do ConfigureManager (instâncias paradas; custo sob lock). 5 regressões
+  novas (TestHuntAB_*).
+
 ## [v0.0.7] — baseline da revisão
 
 Estado auditado em [`CB.md`](CB.md) e validado empiricamente em

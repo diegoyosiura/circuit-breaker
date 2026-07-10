@@ -379,3 +379,196 @@ func TestRecipe_EmergencyBrakeAndGoldenMetrics(t *testing.T) {
 
 	_ = fmt.Sprintf // mantém fmt no import se refactors removerem usos
 }
+
+// [hunt AB-01] Header Retry-After gigante não pode estourar o int64 e
+// desarmar o gate: satura e o cap de maxWait faz o resto.
+func TestHuntAB_RetryAfterOverflowClamped(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		resp := okResponse(r)
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Header.Set("Retry-After", "10000000000") // estouraria int64 em ns
+		return resp, nil
+	})
+	cb := circuitbreaker.NewCircuitBreakerWithOptions("ab1", 0, 0, 0, 2,
+		circuitbreaker.WithRetryAfter(70*time.Millisecond))
+	defer cb.Stop()
+	circuitbreaker.SetBackoffForTest(cb, time.Millisecond) // piso RA-04 pequeno
+
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, "http://ab1.test/x", nil)
+	resp, err := cb.Do(req, &http.Client{Transport: tr})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	mu.Lock()
+	c := calls
+	mu.Unlock()
+	// 3 tentativas com ~70ms de espera CAPADA entre elas (não imediatas!)
+	if c != 3 {
+		t.Fatalf("tentativas: %d", c)
+	}
+	if elapsed < 130*time.Millisecond {
+		t.Fatalf("overflow desarmou as esperas: %d tentativas em %v (esperado >=140ms)", c, elapsed)
+	}
+	// e o gate global ficou armado para a próxima chamada
+	start = time.Now()
+	err = doWithDeadline(t, cb, &http.Client{Transport: tr}, "http://ab1.test/x", 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("gate deveria estar armado pós-overflow: %v", err)
+	}
+}
+
+// [hunt AB-02] Extensão do gate DURANTE a espera é honrada (loop re-checa).
+// Cenário real: uma resposta 429 JÁ EM VOO (enviada antes de o gate armar)
+// chega enquanto outras chamadas dormem no gate — elas devem re-dormir até
+// o prazo estendido, não atravessar a pausa.
+func TestHuntAB_GateExtensionDuringWaitHonored(t *testing.T) {
+	fast429 := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp := okResponse(r)
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Header.Set("Retry-After", "1")
+		return resp, nil
+	})
+	slow429 := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		time.Sleep(150 * time.Millisecond) // resposta em voo, chega no meio do sono alheio
+		resp := okResponse(r)
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Header.Set("Retry-After", "1")
+		return resp, nil
+	})
+	ok := &http.Client{Transport: &countingTransport{}}
+	cb := circuitbreaker.NewCircuitBreakerWithOptions("ab2", 0, 0, 0, 0,
+		circuitbreaker.WithRetryAfter(300*time.Millisecond))
+	defer cb.Stop()
+
+	// A: parte ANTES do gate existir; sua resposta 429 chega em t≈150ms
+	// e estende o gate até ≈450ms.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r, _ := http.NewRequest(http.MethodGet, "http://ab2.test/slow", nil)
+		resp, _ := cb.Do(r, &http.Client{Transport: slow429})
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// gate inicial: até ≈310ms
+	req, _ := http.NewRequest(http.MethodGet, "http://ab2.test/x", nil)
+	resp, _ := cb.Do(req, &http.Client{Transport: fast429})
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	// B: dorme no gate a partir de t≈20ms
+	bStart := time.Now()
+	r, _ := http.NewRequest(http.MethodGet, "http://ab2.test/y", nil)
+	resp, err := cb.Do(r, ok)
+	if err != nil {
+		t.Fatalf("B deveria suceder após o gate: %v", err)
+	}
+	_ = resp.Body.Close()
+	waited := time.Since(bStart)
+	wg.Wait()
+
+	// Sem o loop de re-checagem, B atravessaria no prazo ANTIGO (~290ms).
+	// Com o loop, só passa após a extensão de t≈150ms+300ms ≈ 450ms.
+	if waited < 380*time.Millisecond {
+		t.Fatalf("extensão do gate ignorada: B esperou só %v (esperado >=380ms)", waited)
+	}
+}
+
+// [hunt RA-03] Stop() desbloqueia chamada presa no gate (breaker com rate limit).
+func TestHuntAB_StopUnblocksGateWait(t *testing.T) {
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp := okResponse(r)
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Header.Set("Retry-After", "60")
+		return resp, nil
+	})
+	cb := circuitbreaker.NewCircuitBreakerWithOptions("ab3", 0, 100, 1, 0,
+		circuitbreaker.WithRetryAfter(30*time.Second))
+	// arma um gate LONGO
+	req, _ := http.NewRequest(http.MethodGet, "http://ab3.test/x", nil)
+	resp, err := cb.Do(req, &http.Client{Transport: tr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cb.Do(req, &http.Client{Transport: tr}) // preso no gate
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cb.Stop()
+	select {
+	case err := <-done:
+		if !errors.Is(err, circuitbreaker.ErrStopped) {
+			t.Fatalf("esperava ErrStopped: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() não desbloqueou a espera do gate")
+	}
+}
+
+// [hunt RA-04] Retry-After: 0 não vira martelada imediata — piso de backoff.
+func TestHuntAB_RetryAfterZeroHasBackoffFloor(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		resp := okResponse(r)
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Header.Set("Retry-After", "0")
+		return resp, nil
+	})
+	cb := circuitbreaker.NewCircuitBreakerWithOptions("ab4", 0, 0, 0, 2,
+		circuitbreaker.WithRetryAfter(time.Minute))
+	defer cb.Stop()
+	circuitbreaker.SetBackoffForTest(cb, 60*time.Millisecond)
+
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, "http://ab4.test/x", nil)
+	resp, err := cb.Do(req, &http.Client{Transport: tr})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 3 {
+		t.Fatalf("tentativas: %d", calls)
+	}
+	if elapsed < 110*time.Millisecond {
+		t.Fatalf("Retry-After:0 virou martelada imediata (%d chamadas em %v; piso: 2x60ms)", calls, elapsed)
+	}
+}
+
+// [hunt AB-03] Spec com rate limit incompleto é rejeitada (tudo-ou-nada).
+func TestHuntAB_SpecInconsistentRejected(t *testing.T) {
+	m := circuitbreaker.NewManager()
+	_, err := circuitbreaker.ConfigureManager(m, map[string]circuitbreaker.BreakerSpec{
+		"ok":     {MaxConcurrent: 1},
+		"quebra": {MaxRequests: 100}, // sem WindowSeconds → rate limit desligado silencioso
+	})
+	if err == nil {
+		t.Fatal("spec inconsistente deveria ser rejeitada")
+	}
+	if m.GetCircuitBreaker("ok") != nil {
+		t.Fatal("tudo-ou-nada: nada pode ter sido criado")
+	}
+}

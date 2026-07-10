@@ -113,14 +113,20 @@ flowchart TB
     E -- "open" --> F["retorna ErrCircuitOpen<br/>fast-fail: não consome semáforo,<br/>token, nem métricas"]
     E -- "closed / sonda" --> G["adquire slot do semáforo<br/>(ou ctx.Done → erro)"]
     G --> H["loop attempt = 0..maxRetries"]
-    H --> I{"espera token<br/>do bucket"}
+    H --> GA{"gate Retry-After ativo?<br/>(WithRetryAfter)"}
+    GA -- "sim: espera o prazo<br/>(re-checa extensões; ctx/Stop interrompem)" --> I
+    GA -- não --> I
+    I{"espera token<br/>do bucket"}
     I -- "ctx cancelado" --> J["failed++ e token_wait_cancellations++<br/>retorna ctx.Err() — NEUTRO p/ o circuito"]
     I -- "pós-Stop, sem sobras" --> K["retorna ErrStopped"]
     I -- token --> L["clona o request<br/>attempt>0: Body = GetBody()"]
     L --> M{"cl.Do(clone)"}
     M -- "err == nil" --> N{"status ≥ WithStatusCodeFailure?"}
-    N -- não --> O["success++ → retorna resp"]
-    N -- sim --> P["failed++ → retorna resp (err==nil)<br/>conta como falha p/ o circuito"]
+    N -- não --> RA
+    N -- sim --> RA{"429/503 com Retry-After?<br/>(WithRetryAfter)"}
+    RA -- "sim: arma o gate GLOBAL;<br/>restam tentativas + corpo rebobinável" --> RB["espera max(prazo capado, backoff)<br/>e re-tenta"]
+    RB --> H
+    RA -- não --> O["retorna resp<br/>(success++ ou failed++ conforme status)"]
     M -- erro --> Q{"retryable?<br/>(default: net.Error Timeout/Temporary)"}
     Q -- não --> R["retorna o erro original"]
     Q -- "sim, corpo não-rebobinável" --> R
@@ -274,7 +280,7 @@ if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
 | `successful_requests` | Tentativas sem erro de transporte (inclui 4xx/5xx, salvo `WithStatusCodeFailure`) |
 | `failed_requests` | Tentativas com erro + cancelamentos na espera de token (**pode exceder** `total_requests`) |
 | `retry_count` | Re-tentativas agendadas |
-| `token_wait_cancellations` | Contextos cancelados/expirados esperando token (cancelamento local ≠ falha remota) |
+| `token_wait_cancellations` | Contextos cancelados/expirados esperando permissão de envio — token do bucket **ou** gate Retry-After (cancelamento local ≠ falha remota) |
 | `mean_requests` | Média das últimas 20 esperas por token (s) |
 | `mean_successful_requests` / `mean_failed_requests` / `mean_retry_count` | Média das últimas 20 durações espera+round-trip (s) |
 | `ratio_01/05/10_*` | **Contagem** de eventos nos últimos 1/5/10 min (calculada no registro; "stale" até o próximo evento) |

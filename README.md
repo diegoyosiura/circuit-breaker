@@ -1,9 +1,11 @@
 # Circuit Breaker (Go)
 
+![Release](https://img.shields.io/github/v/tag/diegoyosiura/circuit-breaker?label=release&sort=semver)
 ![Production](https://img.shields.io/badge/status-production-brightgreen)
 ![Go Version](https://img.shields.io/badge/go-1.26+-blue)
 ![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/go.yml/badge.svg)
 ![Coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
+[![Go Reference](https://pkg.go.dev/badge/github.com/diegoyosiura/circuit-breaker.svg)](https://pkg.go.dev/github.com/diegoyosiura/circuit-breaker)
 
 Cliente HTTP resiliente, **sem dependências externas** (só stdlib), que compõe quatro camadas de proteção:
 
@@ -113,14 +115,20 @@ flowchart TB
     E -- "open" --> F["retorna ErrCircuitOpen<br/>fast-fail: não consome semáforo,<br/>token, nem métricas"]
     E -- "closed / sonda" --> G["adquire slot do semáforo<br/>(ou ctx.Done → erro)"]
     G --> H["loop attempt = 0..maxRetries"]
-    H --> I{"espera token<br/>do bucket"}
+    H --> GA{"gate Retry-After ativo?<br/>(WithRetryAfter)"}
+    GA -- "sim: espera o prazo<br/>(re-checa extensões; ctx/Stop interrompem)" --> I
+    GA -- não --> I
+    I{"espera token<br/>do bucket"}
     I -- "ctx cancelado" --> J["failed++ e token_wait_cancellations++<br/>retorna ctx.Err() — NEUTRO p/ o circuito"]
     I -- "pós-Stop, sem sobras" --> K["retorna ErrStopped"]
     I -- token --> L["clona o request<br/>attempt>0: Body = GetBody()"]
     L --> M{"cl.Do(clone)"}
     M -- "err == nil" --> N{"status ≥ WithStatusCodeFailure?"}
-    N -- não --> O["success++ → retorna resp"]
-    N -- sim --> P["failed++ → retorna resp (err==nil)<br/>conta como falha p/ o circuito"]
+    N -- não --> RA
+    N -- sim --> RA{"429/503 com Retry-After?<br/>(WithRetryAfter)"}
+    RA -- "sim: arma o gate GLOBAL;<br/>restam tentativas + corpo rebobinável" --> RB["espera max(prazo capado, backoff)<br/>e re-tenta"]
+    RB --> H
+    RA -- não --> O["retorna resp<br/>(success++ ou failed++ conforme status)"]
     M -- erro --> Q{"retryable?<br/>(default: net.Error Timeout/Temporary)"}
     Q -- não --> R["retorna o erro original"]
     Q -- "sim, corpo não-rebobinável" --> R
@@ -191,6 +199,8 @@ Propriedades: a espera por token respeita o contexto; após `Stop()`, sobras do 
 | `WithRetryPolicy(fn)` | Classificação de retry customizada | só `net.Error` com `Timeout()`/`Temporary()` |
 | `WithExponentialBackoff(base, max, jitter)` | Espera `min(max, base·2ⁿ)`, jitter em `[d/2, d)` | 500 ms fixo |
 | `WithDefaultTimeout(d)` | Teto de duração **apenas** quando `cl.Timeout == 0` **e** o request não tem deadline | sem teto (pode esperar para sempre) |
+| `WithBurst(n)` | Capacidade do bucket (rajada) desacoplada da taxa — essencial para limites rígidos de API | rajada = `maxRequests` (~2× o limite na 1ª janela!) |
+| `WithRetryAfter(maxWait)` | Honra `Retry-After` de 429/503: **gate global** pausa o breaker inteiro + retry da própria chamada após o prazo (cap em `maxWait`) | 429/503 devolvidos direto, sem pausa |
 
 ### Semântica efetiva de retry (default)
 
@@ -201,6 +211,46 @@ Propriedades: a espera por token respeita o contexto; após `Stop()`, sobras do 
 | Erro retryable embrulhado com `fmt.Errorf("%w", ...)` dentro do transport | ❌ (`url.Error` sonda por type-assertion direta) |
 | Erro genérico | ❌ |
 | Corpo não-rebobinável (`GetBody == nil`) após falha retryable | ❌ devolve o erro da tentativa |
+
+## Receita anti-bloqueio (limites rígidos de APIs externas)
+
+Para APIs que **bloqueiam** quem excede o limite (ex.: 200 req/min, ou "sem chamadas simultâneas"), configure tudo num único lugar com `ConfigureManager`:
+
+```go
+specs := map[string]circuitbreaker.BreakerSpec{
+	// Limite rígido de 200 req/min. REGRA: maxRequests + burst <= limite.
+	// (Sem WithBurst, a rajada = maxRequests e a 1ª janela pós-ociosa
+	// chega a ~2× o limite → bloqueio.)
+	"ccee": {MaxRequests: 199, WindowSeconds: 60, MaxRetries: 2,
+		Options: []circuitbreaker.Option{
+			circuitbreaker.WithBurst(1),                    // 1+199 = 200 ✓ em QUALQUER janela
+			circuitbreaker.WithRetryAfter(2 * time.Minute), // API pediu pausa? TODOS pausam
+			circuitbreaker.WithStatusCodeFailure(429),      // 429 = falha
+			circuitbreaker.WithBreaker(3, time.Minute, 1),  // freio: 3 seguidas → para tudo
+		}},
+
+	// Sem requisições simultâneas: semáforo de 1.
+	"omie": {MaxConcurrent: 1, MaxRetries: 2},
+}
+
+breakers, err := circuitbreaker.ConfigureManager(m, specs) // tudo-ou-nada; idempotente
+```
+
+**As duas métricas de ouro** para operar isso:
+
+```go
+for host, eps := range breakers["ccee"].Metrics() {
+	root := eps["::root"]
+	// 1) Saturação do SEU orçamento (aja ANTES de a API reclamar):
+	//    cancelamentos esperando token subindo = chamadas morrendo na fila.
+	_ = root.TokenWaitCancellations
+	// 2) A API começou a recusar (alerta imediato):
+	_ = root.Ratio01FailedRequests // falhas no último minuto (com 429=falha)
+	_ = host
+}
+```
+
+**Atenção — orçamento é por processo:** com N réplicas do serviço, divida `maxRequests` por N ou centralize as chamadas dessa API em uma instância.
 
 ## Manager
 
@@ -232,7 +282,7 @@ if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
 | `successful_requests` | Tentativas sem erro de transporte (inclui 4xx/5xx, salvo `WithStatusCodeFailure`) |
 | `failed_requests` | Tentativas com erro + cancelamentos na espera de token (**pode exceder** `total_requests`) |
 | `retry_count` | Re-tentativas agendadas |
-| `token_wait_cancellations` | Contextos cancelados/expirados esperando token (cancelamento local ≠ falha remota) |
+| `token_wait_cancellations` | Contextos cancelados/expirados esperando permissão de envio — token do bucket **ou** gate Retry-After (cancelamento local ≠ falha remota) |
 | `mean_requests` | Média das últimas 20 esperas por token (s) |
 | `mean_successful_requests` / `mean_failed_requests` / `mean_retry_count` | Média das últimas 20 durações espera+round-trip (s) |
 | `ratio_01/05/10_*` | **Contagem** de eventos nos últimos 1/5/10 min (calculada no registro; "stale" até o próximo evento) |

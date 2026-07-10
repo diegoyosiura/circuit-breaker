@@ -392,11 +392,18 @@ func TestRegression_PerRequestCostFlat(t *testing.T) {
 		perBlock = append(perBlock, us)
 		t.Logf("bloco %d: %.2f µs/req", b, us)
 	}
-	ratio := perBlock[4] / perBlock[0]
-	if ratio > 1.2 {
-		t.Fatalf("custo por request cresce com o histórico: bloco5/bloco1 = %.2fx (limite 1,2)", ratio)
+	// Sinal do bug (A4): custo ABSOLUTO crescendo com o histórico — 68µs/req
+	// no 1º bloco chegando a 640µs/req no 5º. Pós-fix, todos os blocos ficam
+	// em ~3-5µs/req. A guarda primária é absoluta (razão sobre microssegundos
+	// amplifica ruído de scheduler: 1,4x de 3µs é ±1µs de jitter, não bug).
+	if perBlock[4] > 25 {
+		t.Fatalf("custo por request no 5º bloco: %.2f µs/req (esperado <25; bug era ~600)", perBlock[4])
 	}
-	t.Logf("razão bloco5/bloco1 = %.2fx", ratio)
+	ratio := perBlock[4] / perBlock[0]
+	if ratio > 3.0 {
+		t.Fatalf("custo por request cresce com o histórico: bloco5/bloco1 = %.2fx (limite 3,0)", ratio)
+	}
+	t.Logf("razão bloco5/bloco1 = %.2fx; 5º bloco = %.2f µs/req", ratio, perBlock[4])
 }
 
 // R1 [A10] — client nil usa http.DefaultClient em vez de panicar.

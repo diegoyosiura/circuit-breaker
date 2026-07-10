@@ -26,6 +26,7 @@ type (
 	Option            = pkg.Option
 	BreakerState      = pkg.BreakerState
 	StateReporter     = pkg.StateReporter
+	BreakerSpec       = pkg.BreakerSpec
 )
 
 // Estados da máquina opcional (WithBreaker).
@@ -71,3 +72,13 @@ func WithExponentialBackoff(base, max time.Duration, jitter bool) Option {
 }
 
 func WithDefaultTimeout(d time.Duration) Option { return pkg.WithDefaultTimeout(d) }
+
+func WithBurst(n int) Option { return pkg.WithBurst(n) }
+
+func WithRetryAfter(maxWait time.Duration) Option { return pkg.WithRetryAfter(maxWait) }
+
+// ConfigureManager registra um mapa nome→BreakerSpec de uma só vez
+// (validação tudo-ou-nada; ver pkg.ConfigureManager).
+func ConfigureManager(m IManager, specs map[string]BreakerSpec) (map[string]ICircuitBreaker, error) {
+	return pkg.ConfigureManager(m, specs)
+}

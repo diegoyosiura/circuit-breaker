@@ -106,7 +106,13 @@ func (w *bucketWheel) advance(sec int64) {
 func (w *bucketWheel) record(t time.Time) {
 	sec := t.Unix()
 	w.advance(sec)
-	if sec == w.lastSec { // dentro da roda (eventos antigos demais são ignorados)
+	switch {
+	case sec == w.lastSec:
+		w.buckets[sec%wheelSeconds]++
+	case sec < w.lastSec && w.lastSec-sec < wheelSeconds:
+		// Evento com início no passado recente (corrida natural entre
+		// goroutinas: outra já avançou a roda): o bucket daquele segundo
+		// ainda é válido — descartar subcontaria os ratios [hunt MW-1].
 		w.buckets[sec%wheelSeconds]++
 	}
 }

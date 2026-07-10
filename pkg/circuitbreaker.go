@@ -3,6 +3,7 @@ package circuitbreaker
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -11,6 +12,10 @@ import (
 )
 
 // Limites de sanidade do token bucket (F5/D5 do PLANO.md).
+// maxEndpointsPerHost limita a cardinalidade de métricas por host (inclui as
+// chaves sintéticas ::root/::other); excedentes agregam em "::other".
+const maxEndpointsPerHost = 1026
+
 const (
 	minTokenInterval  = time.Millisecond      // abaixo disto o ticker é engrossado
 	clampedTick       = 25 * time.Millisecond // tick real quando clampado (≤40 acordadas/s)
@@ -163,6 +168,11 @@ func (cb *circuitBreaker) startTokenBucket() {
 // resp.StatusCode. After Stop(), Do returns ErrStopped once the remaining
 // tokens are exhausted.
 func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *http.Response, finalErr error) {
+	// Requests malformados retornam erro em vez de panic [hunt API-05].
+	if req == nil || req.URL == nil {
+		return nil, errors.New("circuitbreaker: nil *http.Request or nil request URL")
+	}
+
 	// R1: nil client falls back to http.DefaultClient instead of panicking.
 	// Callers SHOULD provide a client with Timeout (or a request deadline):
 	// a hung server otherwise pins the semaphore slot forever (CB.md A10).
@@ -171,26 +181,55 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 	}
 
 	// WithDefaultTimeout: aplica-se APENAS quando o chamador não definiu
-	// nenhum limite (client sem Timeout e request sem deadline).
+	// nenhum limite (client sem Timeout e request sem deadline). O cancel do
+	// contexto NÃO pode rodar no retorno de Do: isso mataria a leitura do
+	// Body pelo chamador (o transporte aborta a conexão de ctx cancelado)
+	// [hunt SM-2]. Em sucesso, o cancel é amarrado ao Close() do Body; o
+	// próprio timeout garante que o contexto não vaza indefinidamente.
 	if cb.defaultTimeout > 0 && cl.Timeout == 0 {
 		if _, has := req.Context().Deadline(); !has {
 			ctx, cancel := context.WithTimeout(req.Context(), cb.defaultTimeout)
-			defer cancel()
 			req = req.WithContext(ctx)
+			defer func() {
+				if finalErr != nil || finalResp == nil || finalResp.Body == nil {
+					cancel()
+					return
+				}
+				finalResp.Body = &cancelOnClose{ReadCloser: finalResp.Body, cancel: cancel}
+			}()
 		}
 	}
+
+	// lastErr guarda a última falha REAL de transporte: usada para escalar
+	// desfechos neutros (tempo esgotado no backoff/token APÓS falhas reais)
+	// para falha na máquina de estados [hunt DO-INT-2].
+	var lastErr error
 
 	// WithBreaker: fast-fail ANTES de consumir semáforo/token — o propósito
 	// do circuito aberto é não gastar recurso algum com downstream doente.
 	probe := false
+	var probeGen uint64
 	if cb.state != nil {
 		var allowErr error
-		probe, allowErr = cb.state.allow(time.Now())
+		probe, probeGen, allowErr = cb.state.allow(time.Now())
 		if allowErr != nil {
 			return nil, allowErr
 		}
 		defer func() {
-			cb.state.report(probe, classifyOutcome(finalResp, finalErr, cb.statusFailMin))
+			// Panic no transporte não pode virar "sucesso" (finalResp/finalErr
+			// zerados): conta como falha e o panic segue propagando [hunt API-04].
+			if r := recover(); r != nil {
+				cb.state.report(probe, probeGen, outcomeFailure)
+				panic(r)
+			}
+			o := classifyOutcome(finalResp, finalErr, cb.statusFailMin)
+			// Escalação ESTREITA [DO-INT-2]: apenas deadline que estourou após
+			// falhas reais de transporte vira falha (o downstream falhou E está
+			// lento). Cancel explícito e erros locais permanecem neutros.
+			if o == outcomeNeutral && lastErr != nil && errors.Is(finalErr, context.DeadlineExceeded) {
+				o = outcomeFailure
+			}
+			cb.state.report(probe, probeGen, o)
 		}()
 	}
 
@@ -210,7 +249,6 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 		endpoint = "/"
 	}
 
-	var lastErr error
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
 		start := time.Now()
 		if err := cb.waitForToken(req.Context()); err != nil {
@@ -233,7 +271,10 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 		if attempt > 0 && req.Body != nil {
 			body, bodyErr := req.GetBody()
 			if bodyErr != nil {
-				return nil, bodyErr
+				// Registra a falha da tentativa (senão total > ok+fail) e marca
+				// como erro LOCAL — não é evidência sobre o downstream [DO-INT-4].
+				cb.recordFailure(host, endpoint, start, time.Now())
+				return nil, &localOpError{err: bodyErr}
 			}
 			newReq.Body = body
 		}
@@ -288,6 +329,20 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 	return nil, &retriesExhaustedError{last: lastErr}
 }
 
+// cancelOnClose amarra o cancel do contexto de WithDefaultTimeout ao Close()
+// do Body: o chamador consegue ler a resposta inteira e o contexto é liberado
+// no fechamento (ou, no pior caso, quando o próprio timeout dispara).
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
 // Stop gracefully shuts down the token bucket goroutine. Idempotent and
 // safe for concurrent use. After Stop, in-flight and future Do calls are
 // released with ErrStopped once the tokens remaining in the bucket are
@@ -306,6 +361,12 @@ func (cb *circuitBreaker) Stop() {
 func (cb *circuitBreaker) waitForToken(ctx context.Context) error {
 	if cb.tokens == nil {
 		return nil
+	}
+
+	// Contexto já cancelado não consome token: chamadas mortas-na-chegada
+	// não podem queimar budget de rate de chamadas vivas [hunt TB-02].
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Fast path: tokens já disponíveis são atendidos mesmo após Stop()
@@ -417,6 +478,13 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*en
 		cb.metrics = make(map[string]map[string]*endpointState)
 	}
 
+	// Um path real igual às chaves sintéticas não pode aliasar os agregados
+	// [hunt MW-2]. (Paths de URLs reais começam com "/", mas URLs artesanais
+	// podem produzir qualquer coisa.)
+	if endpoint == "::root" || endpoint == "::other" {
+		endpoint = "/" + endpoint
+	}
+
 	hostMetrics, ok := cb.metrics[host]
 	if !ok {
 		hostMetrics = make(map[string]*endpointState)
@@ -426,8 +494,20 @@ func (cb *circuitBreaker) updateMetrics(host, endpoint string, updateFn func(*en
 
 	state, ok := hostMetrics[endpoint]
 	if !ok {
-		state = &endpointState{}
-		hostMetrics[endpoint] = state
+		// Cardinalidade limitada por host: paths únicos ilimitados (ex.:
+		// /user/{id}) reteriam ~14KB cada para sempre [hunt API-03]. Ao
+		// atingir o teto, novos endpoints agregam em "::other".
+		if len(hostMetrics) >= maxEndpointsPerHost {
+			endpoint = "::other"
+			state = hostMetrics[endpoint]
+			if state == nil {
+				state = &endpointState{}
+				hostMetrics[endpoint] = state
+			}
+		} else {
+			state = &endpointState{}
+			hostMetrics[endpoint] = state
+		}
 	}
 
 	updateFn(state)

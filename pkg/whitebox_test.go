@@ -48,32 +48,34 @@ func TestBreakerHalfOpenProbeAccounting(t *testing.T) {
 	now := time.Now()
 
 	// abre e espera o openFor expirar
-	b.report(false, outcomeFailure)
+	b.report(false, 0, outcomeFailure)
 	if b.current() != StateOpen {
 		t.Fatal("1 falha com threshold 1 deve abrir")
 	}
 	later := now.Add(10 * time.Millisecond)
 
-	p1, err1 := b.allow(later)
-	p2, err2 := b.allow(later)
+	p1, g1, err1 := b.allow(later)
+	p2, _, err2 := b.allow(later)
 	if err1 != nil || err2 != nil || !p1 || !p2 {
 		t.Fatalf("2 sondas devem ser admitidas: %v %v", err1, err2)
 	}
-	if _, err := b.allow(later); !errors.Is(err, ErrCircuitOpen) {
+	if _, _, err := b.allow(later); !errors.Is(err, ErrCircuitOpen) {
 		t.Fatal("3ª chamada com sondas esgotadas deve fast-failar")
 	}
 
 	// desfecho NEUTRO libera o slot da sonda sem transição
-	b.report(true, outcomeNeutral)
+	b.report(true, g1, outcomeNeutral)
 	if b.current() != StateHalfOpen {
 		t.Fatal("neutro não pode transicionar")
 	}
-	if _, err := b.allow(later); err != nil {
+	if _, g3, err := b.allow(later); err != nil {
 		t.Fatalf("slot liberado deve readmitir sonda: %v", err)
+	} else {
+		g1 = g3
 	}
 
 	// sonda com sucesso fecha
-	b.report(true, outcomeSuccess)
+	b.report(true, g1, outcomeSuccess)
 	if b.current() != StateClosed {
 		t.Fatal("sonda com sucesso deve fechar")
 	}
@@ -84,30 +86,30 @@ func TestBreakerReportStaleCalls(t *testing.T) {
 	b := newBreakerState(2, time.Hour, 1)
 
 	// chamada admitida em closed que termina após o circuito abrir: no-op
-	b.report(false, outcomeFailure)
-	b.report(false, outcomeFailure) // abre
+	b.report(false, 0, outcomeFailure)
+	b.report(false, 0, outcomeFailure) // abre
 	if b.current() != StateOpen {
 		t.Fatal("deveria abrir com 2 falhas")
 	}
-	b.report(false, outcomeSuccess) // antiga concluindo em open: ignorada
+	b.report(false, 0, outcomeSuccess) // antiga concluindo em open: ignorada
 	if b.current() != StateOpen {
 		t.Fatal("chamada antiga não pode fechar circuito aberto")
 	}
 
 	// em half-open, desfecho de chamada NÃO-sonda é ignorado
 	b2 := newBreakerState(1, time.Nanosecond, 1)
-	b2.report(false, outcomeFailure) // abre
+	b2.report(false, 0, outcomeFailure) // abre
 	time.Sleep(time.Millisecond)
-	if _, err := b2.allow(time.Now()); err != nil { // vira half-open, admite sonda
+	if _, _, err := b2.allow(time.Now()); err != nil { // vira half-open, admite sonda
 		t.Fatalf("sonda deveria ser admitida: %v", err)
 	}
-	b2.report(false, outcomeFailure) // chamada antiga (não-sonda): ignorada
+	b2.report(false, 0, outcomeFailure) // chamada antiga (não-sonda): ignorada
 	if b2.current() != StateHalfOpen {
 		t.Fatal("não-sonda não pode transicionar half-open")
 	}
 	// neutro em closed também é no-op
 	b3 := newBreakerState(1, time.Hour, 1)
-	b3.report(false, outcomeNeutral)
+	b3.report(false, 0, outcomeNeutral)
 	if b3.current() != StateClosed || b3.consecFails != 0 {
 		t.Fatal("neutro em closed é no-op")
 	}
@@ -128,6 +130,9 @@ func TestClassifyOutcomeTable(t *testing.T) {
 		{"500 com política", resp(500), nil, 500, outcomeFailure},
 		{"499 com política 500", resp(499), nil, 500, outcomeSuccess},
 		{"erro de transporte (url.Error)", nil, urlErr, 0, outcomeFailure},
+		{"cancelamento EM VOO (url.Error{Canceled})", nil, &url.Error{Op: "Get", URL: "http://x", Err: context.Canceled}, 0, outcomeNeutral},
+		{"timeout de transporte (url.Error{DeadlineExceeded})", nil, &url.Error{Op: "Get", URL: "http://x", Err: context.DeadlineExceeded}, 0, outcomeFailure},
+		{"erro local (GetBody)", nil, &localOpError{err: errors.New("gb")}, 0, outcomeNeutral},
 		{"ctx.Canceled local", nil, context.Canceled, 0, outcomeNeutral},
 		{"DeadlineExceeded local", nil, context.DeadlineExceeded, 0, outcomeNeutral},
 		{"ErrStopped", nil, ErrStopped, 0, outcomeNeutral},

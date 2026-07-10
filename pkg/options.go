@@ -27,6 +27,14 @@ type expBackoffConfig struct {
 // por `openFor`; depois, até `halfOpenProbes` sondas simultâneas são
 // admitidas — sucesso fecha, falha reabre. O estado é consultável via a
 // interface opcional StateReporter.
+//
+// ATENÇÃO: valores <= 0 são sanitizados para os MÍNIMOS (threshold=1,
+// openFor=30s, probes=1) — WithBreaker(0, 0, 0) é o breaker mais agressivo
+// possível, não um no-op [hunt API-07].
+//
+// A admissão é decidida na ENTRADA de Do(): chamadas já admitidas (na fila
+// do semáforo/token) prosseguem mesmo que o circuito abra durante a espera
+// [hunt SM-4 — comportamento deliberado, comum às implementações canônicas].
 func WithBreaker(consecutiveFailures int, openFor time.Duration, halfOpenProbes int) Option {
 	return func(cb *circuitBreaker) {
 		cb.state = newBreakerState(consecutiveFailures, openFor, halfOpenProbes)
@@ -92,18 +100,25 @@ func NewCircuitBreakerWithOptions(
 ) ICircuitBreaker {
 	cb := newCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
 	for _, opt := range opts {
-		opt(cb)
+		if opt != nil { // Option nil explícita é ignorada [hunt OPT-02]
+			opt(cb)
+		}
 	}
 	return cb
 }
 
-// backoffFor calcula a espera antes da tentativa attempt+1.
+// backoffFor calcula a espera antes da tentativa attempt+1. A duplicação é
+// iterativa com parada no teto: shift direto (base << attempt) pode dar wrap
+// para um positivo pequeno e escapar do clamp [hunt OPT-03].
 func (cb *circuitBreaker) backoffFor(attempt int) time.Duration {
 	if cb.expBackoff == nil {
 		return cb.backoff
 	}
-	d := cb.expBackoff.base << attempt
-	if d <= 0 || d > cb.expBackoff.max { // <<= pode estourar
+	d := cb.expBackoff.base
+	for i := 0; i < attempt && d < cb.expBackoff.max; i++ {
+		d *= 2
+	}
+	if d <= 0 || d > cb.expBackoff.max {
 		d = cb.expBackoff.max
 	}
 	if cb.expBackoff.jitter && d > 1 {

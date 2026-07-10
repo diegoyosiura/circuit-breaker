@@ -150,7 +150,7 @@ stateDiagram-v2
     end note
 ```
 
-O que conta como **falha** para o circuito: erro de transporte devolvido por `Do` e, com `WithStatusCodeFailure(min)`, respostas com status ≥ min. Cancelamentos **locais** (contexto expirado esperando token/backoff, `ErrStopped`) são **neutros** — não abrem o circuito, pois não evidenciam falha do downstream. Sucesso zera a contagem de falhas consecutivas.
+O que conta como **falha** para o circuito: erro de transporte devolvido por `Do` (exceto cancelamento explícito) e, com `WithStatusCodeFailure(min)`, respostas com status ≥ min. **Neutros** (não abrem o circuito): `context.Canceled` em qualquer ponto — inclusive com a requisição **em voo** (cancelar é ação do chamador, não evidência sobre o downstream) —, `ErrStopped` e erros locais (ex.: `GetBody` falhou). Exceção deliberada: deadline que estoura **após falhas reais de transporte** na mesma chamada conta como falha (downstream falhando e lento). Panic no transporte propaga e conta como falha. Sucesso zera a contagem de falhas consecutivas.
 
 ### Token bucket
 
@@ -237,7 +237,7 @@ if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
 | `mean_successful_requests` / `mean_failed_requests` / `mean_retry_count` | Média das últimas 20 durações espera+round-trip (s) |
 | `ratio_01/05/10_*` | **Contagem** de eventos nos últimos 1/5/10 min (calculada no registro; "stale" até o próximo evento) |
 
-Os campos `Time*`/`StartTime*` (tag `json:"-"`) expõem as últimas ≤20 amostras.
+Os campos `Time*`/`StartTime*` (tag `json:"-"`) expõem as últimas ≤20 amostras. A cardinalidade de endpoints por host é limitada (~1k); paths únicos excedentes (ex.: `/user/{id}` sem normalização) agregam na chave `::other`.
 
 ## Erros sentinela
 

@@ -1,9 +1,11 @@
 # Circuit Breaker (Go)
 
+![Release](https://img.shields.io/github/v/tag/diegoyosiura/circuit-breaker?label=release&sort=semver)
 ![Production](https://img.shields.io/badge/status-production-brightgreen)
 ![Go Version](https://img.shields.io/badge/go-1.26+-blue)
 ![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/go.yml/badge.svg)
 ![Coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
+[![Go Reference](https://pkg.go.dev/badge/github.com/diegoyosiura/circuit-breaker.svg)](https://pkg.go.dev/github.com/diegoyosiura/circuit-breaker)
 
 Cliente HTTP resiliente, **sem dependências externas** (só stdlib), que compõe quatro camadas de proteção:
 

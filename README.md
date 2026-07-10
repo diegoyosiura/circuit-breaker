@@ -3,179 +3,263 @@
 ![Production](https://img.shields.io/badge/status-production-brightgreen)
 ![Go Version](https://img.shields.io/badge/go-1.26+-blue)
 ![Tests](https://github.com/diegoyosiura/circuit-breaker/actions/workflows/go.yml/badge.svg)
+![Coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
 
-Cliente HTTP resiliente, sem dependências externas (só stdlib), que compõe três padrões de proteção mais observabilidade:
+Cliente HTTP resiliente, **sem dependências externas** (só stdlib), que compõe quatro camadas de proteção:
 
-- **Bulkhead** — limite de requisições simultâneas (semáforo);
-- **Rate limiting** — token bucket com reposição contínua;
-- **Retry** — re-tentativas para erros transitórios de rede, com corpo re-enviado corretamente via `GetBody`;
-- **Métricas** — contadores, médias móveis (últimas 20) e contagens por janela (1/5/10 min) por host/endpoint, com agregado `::root` por host.
+| Camada | Mecanismo | Default |
+|---|---|---|
+| **Bulkhead** | Semáforo de requisições simultâneas | opcional (`maxConcurrent > 0`) |
+| **Rate limiting** | Token bucket com burst + reposição contínua | opcional (`maxRequests/windowSeconds > 0`) |
+| **Retry** | Re-tentativas para erros transitórios, com corpo rebobinado via `GetBody` | opcional (`maxRetries > 0`) |
+| **Circuit breaker** | Estados *closed/open/half-open* com fast-fail (`ErrCircuitOpen`) | **opt-in** (`WithBreaker`) |
 
-> **Nota de escopo:** por default o componente **não ativa a máquina de estados** *closed/open/half-open* do padrão Circuit Breaker clássico — ela existe como **opt-in** via `NewCircuitBreakerWithOptions(..., WithBreaker(...))` (ver seção adiante); sem a opção não há *fast-fail* e o comportamento é o histórico. A análise completa está em [`CB.md`](CB.md); a validação empírica em [`CB-TESTES.md`](CB-TESTES.md); o plano executado em [`PLANO.md`](PLANO.md).
+Mais **métricas por host/endpoint** (contadores, médias móveis, contagens por janela) com agregado `::root` por host, e um **Manager** para registro nomeado de instâncias.
 
 ---
 
-## Instalação
+## ⚡ Quick setup
 
 ```bash
 go get github.com/diegoyosiura/circuit-breaker
 ```
 
-Dois imports equivalentes (os tipos são aliases idênticos):
-
-```go
-import circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg" // histórico
-import "github.com/diegoyosiura/circuit-breaker"                    // raiz, sem alias
-```
-
-## Uso
-
 ```go
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
-	circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg"
+	circuitbreaker "github.com/diegoyosiura/circuit-breaker" // raiz — sem alias manual
 )
 
 func main() {
-	m := circuitbreaker.NewManager()
-
 	// name, maxConcurrent, maxRequests, windowSeconds, maxRetries
-	cb := m.NewCircuitBreaker("minha-api", 50, 200, 30, 3)
+	cb := circuitbreaker.NewCircuitBreakerWithOptions("minha-api", 50, 200, 30, 3,
+		circuitbreaker.WithBreaker(5, 30*time.Second, 2), // circuito de verdade (opcional)
+		circuitbreaker.WithStatusCodeFailure(500),        // 5xx conta como falha (opcional)
+	)
+	defer cb.Stop()
 
-	// SEMPRE use um client com Timeout (ou um request com deadline):
-	// um servidor que aceita a conexão e nunca responde prenderia um
-	// slot do semáforo indefinidamente.
-	cl := &http.Client{Timeout: 10 * time.Second}
-
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/dados", nil)
-	if err != nil {
-		panic(err)
-	}
+	cl := &http.Client{Timeout: 10 * time.Second} // SEMPRE dê um Timeout ao client
+	req, _ := http.NewRequest(http.MethodGet, "https://example.com/dados", nil)
 
 	resp, err := cb.Do(req, cl)
-	if err != nil {
+	switch {
+	case errors.Is(err, circuitbreaker.ErrCircuitOpen):
+		fmt.Println("circuito aberto — downstream doente, use o fallback")
+	case err != nil:
 		fmt.Println("erro:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// IMPORTANTE: err == nil significa que o transporte funcionou.
-	// Status 4xx/5xx chegam aqui como "sucesso" — inspecione o código:
-	if resp.StatusCode >= 400 {
-		fmt.Println("resposta com erro HTTP:", resp.Status)
-		return
-	}
-	fmt.Println("ok:", resp.Status)
-
-	// Shutdown gracioso: pare os breakers registrados.
-	if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
-		lc.StopAll()
+	default:
+		defer resp.Body.Close()
+		fmt.Println("ok:", resp.Status) // atenção: 4xx/5xx chegam aqui com err == nil
 	}
 }
 ```
 
-## Semântica dos parâmetros
+Sem as opções, `NewCircuitBreaker("minha-api", 50, 200, 30, 3)` dá o comportamento clássico (bulkhead + rate limit + retry, sem máquina de estados). Os dois imports são equivalentes — os tipos são *aliases* idênticos:
+
+```go
+import circuitbreaker "github.com/diegoyosiura/circuit-breaker/pkg" // path histórico
+import "github.com/diegoyosiura/circuit-breaker"                    // raiz
+```
+
+---
+
+## Como funciona
+
+### Arquitetura
+
+```mermaid
+flowchart TB
+    caller["Chamador"]
+    subgraph breaker["circuitBreaker (1 por nome)"]
+        STATE["Máquina de estados (opt-in)<br/>closed / open / half-open"]
+        SEM["Semáforo<br/>maxConcurrent slots"]
+        TOK["Token bucket<br/>cap = maxRequests, nasce cheio"]
+        TICK["Goroutine refill<br/>1 token a cada window/maxRequests"]
+        RETRY["Loop de retry<br/>até maxRetries, backoff interrompível"]
+        MET["Métricas por host/endpoint + ::root<br/>rings de 20 amostras + rodas de janela (O(1)/req)"]
+    end
+    M["Manager<br/>registro nomeado (get-or-create)"]
+    HTTP["*http.Client (injetado por chamada)"]
+    DS["Downstream"]
+
+    caller -->|"NewCircuitBreaker(name, ...)"| M
+    M -->|"cria 1x, reusa"| breaker
+    caller -->|"Do(req, cl)"| STATE
+    STATE -->|"closed / sonda"| SEM
+    STATE -->|"open → ErrCircuitOpen<br/>(sem tocar nada)"| caller
+    SEM --> TOK
+    TICK -->|repõe| TOK
+    TOK --> RETRY
+    RETRY -->|"cl.Do(clone + GetBody)"| HTTP
+    HTTP --> DS
+    RETRY -->|registra| MET
+```
+
+### Fluxo de uma chamada `Do(req, cl)`
+
+```mermaid
+flowchart TB
+    A["Do(req, cl)"] --> B["cl == nil → http.DefaultClient"]
+    B --> C{"WithDefaultTimeout e<br/>chamador sem limite?"}
+    C -- sim --> D["envolve ctx com o teto"]
+    C -- não --> E
+    D --> E{"circuito aberto?<br/>(WithBreaker)"}
+    E -- "open" --> F["retorna ErrCircuitOpen<br/>fast-fail: não consome semáforo,<br/>token, nem métricas"]
+    E -- "closed / sonda" --> G["adquire slot do semáforo<br/>(ou ctx.Done → erro)"]
+    G --> H["loop attempt = 0..maxRetries"]
+    H --> I{"espera token<br/>do bucket"}
+    I -- "ctx cancelado" --> J["failed++ e token_wait_cancellations++<br/>retorna ctx.Err() — NEUTRO p/ o circuito"]
+    I -- "pós-Stop, sem sobras" --> K["retorna ErrStopped"]
+    I -- token --> L["clona o request<br/>attempt>0: Body = GetBody()"]
+    L --> M{"cl.Do(clone)"}
+    M -- "err == nil" --> N{"status ≥ WithStatusCodeFailure?"}
+    N -- não --> O["success++ → retorna resp"]
+    N -- sim --> P["failed++ → retorna resp (err==nil)<br/>conta como falha p/ o circuito"]
+    M -- erro --> Q{"retryable?<br/>(default: net.Error Timeout/Temporary)"}
+    Q -- não --> R["retorna o erro original"]
+    Q -- "sim, corpo não-rebobinável" --> R
+    Q -- "sim, restam tentativas" --> S["retry++ e backoff<br/>(fixo 500ms ou exponencial+jitter)<br/>interrompível por ctx"]
+    S --> H
+    Q -- "sim, esgotou" --> T["retorna ErrRetriesExhausted<br/>texto estável + Unwrap da causa"]
+```
+
+### Máquina de estados (opt-in via `WithBreaker`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open : N falhas consecutivas<br/>(threshold)
+    Open --> HalfOpen : openFor decorrido<br/>(na próxima chamada)
+    HalfOpen --> Closed : sonda com sucesso
+    HalfOpen --> Open : sonda falha
+    note right of Open
+        Do() retorna ErrCircuitOpen
+        imediatamente — zero recursos
+        gastos com downstream doente
+    end note
+    note right of HalfOpen
+        até halfOpenProbes sondas
+        simultâneas; excedentes
+        recebem ErrCircuitOpen
+    end note
+```
+
+O que conta como **falha** para o circuito: erro de transporte devolvido por `Do` e, com `WithStatusCodeFailure(min)`, respostas com status ≥ min. Cancelamentos **locais** (contexto expirado esperando token/backoff, `ErrStopped`) são **neutros** — não abrem o circuito, pois não evidenciam falha do downstream. Sucesso zera a contagem de falhas consecutivas.
+
+### Token bucket
+
+```mermaid
+sequenceDiagram
+    participant C as Chamadas
+    participant B as Bucket (cap=4)
+    participant R as Refill (window/maxRequests)
+    Note over B: nasce CHEIO → burst inicial
+    C->>B: 4 chamadas imediatas ✓ (burst)
+    C--xB: 5ª bloqueia (bucket vazio)
+    R->>B: +1 token
+    B->>C: 5ª prossegue ✓
+    Note over C,R: 1ª janela ≈ 2× maxRequests (burst+refill)<br/>depois converge para maxRequests/window
+```
+
+Propriedades: a espera por token respeita o contexto; após `Stop()`, sobras do bucket ainda atendem e depois as chamadas recebem `ErrStopped`; taxas acima de 1000 req/s usam reposição em lote (tick de 25 ms) sem perder a taxa nominal; configurações degeneradas (`maxRequests > 1e6`) têm a capacidade clampada e o construtor permanece instantâneo.
+
+---
+
+## Configuração
+
+### Parâmetros posicionais (contrato clássico)
 
 | Parâmetro | Efeito | Valor ≤ 0 |
 |---|---|---|
 | `name` | Identificador (chave no Manager) | — |
-| `maxConcurrent` | Máximo de requisições simultâneas | desativa o limite |
+| `maxConcurrent` | Máximo de requisições simultâneas | desativa o bulkhead |
 | `maxRequests` + `windowSeconds` | Capacidade do bucket e taxa de reposição | qualquer um ≤ 0 desativa o rate limit |
 | `maxRetries` | Re-tentativas além da inicial (total = `maxRetries+1`) | 0 = sem retry |
 
-Propriedades importantes:
+### Opções (`NewCircuitBreakerWithOptions` — todas opt-in, default inerte)
 
-- **Burst**: o bucket nasce cheio; na primeira janela passam até ~2× `maxRequests` (comportamento canônico de token bucket, medido em 1,95–2,00×). A taxa sustentada converge para `maxRequests/windowSeconds`.
-- **Retry**: só para erros com `Timeout()`/`Temporary()` verdadeiros (timeouts genuínos). `ECONNREFUSED`/`ECONNRESET` **não** são retentados — não martelamos serviço caído. Corpos são re-enviados via `req.GetBody`; corpos não-rebobináveis não são retentados.
-- **Backoff**: fixo de 500 ms entre tentativas, interrompível pelo contexto.
-- **`Stop()`**: idempotente; depois dele, chamadas são liberadas com `ErrStopped` assim que os tokens remanescentes se esgotam.
-- **Exaustão de retries**: o erro devolvido tem o texto estável `"request failed after retries"`, responde a `errors.Is(err, circuitbreaker.ErrRetriesExhausted)` e desembrulha a última causa via `errors.As`/`errors.Is`.
+| Opção | Liga | Sem ela |
+|---|---|---|
+| `WithBreaker(threshold, openFor, probes)` | Estados closed/open/half-open + fast-fail `ErrCircuitOpen` | nunca fast-faila |
+| `WithStatusCodeFailure(min)` | Status ≥ min conta como falha (métricas + circuito); a resposta ainda é devolvida com `err == nil` | 4xx/5xx contam como sucesso |
+| `WithRetryPolicy(fn)` | Classificação de retry customizada | só `net.Error` com `Timeout()`/`Temporary()` |
+| `WithExponentialBackoff(base, max, jitter)` | Espera `min(max, base·2ⁿ)`, jitter em `[d/2, d)` | 500 ms fixo |
+| `WithDefaultTimeout(d)` | Teto de duração **apenas** quando `cl.Timeout == 0` **e** o request não tem deadline | sem teto (pode esperar para sempre) |
+
+### Semântica efetiva de retry (default)
+
+| Erro | Retenta? |
+|---|---|
+| `net.Error` com `Timeout()` ou `Temporary()` (timeouts genuínos, `os.ErrDeadlineExceeded`) | ✅ |
+| `ECONNREFUSED` / `ECONNRESET` (serviço caído) | ❌ deliberado — não martelamos downstream morto |
+| Erro retryable embrulhado com `fmt.Errorf("%w", ...)` dentro do transport | ❌ (`url.Error` sonda por type-assertion direta) |
+| Erro genérico | ❌ |
+| Corpo não-rebobinável (`GetBody == nil`) após falha retryable | ❌ devolve o erro da tentativa |
 
 ## Manager
 
-`NewManager()` devolve um registro nomeado (uma instância por nome):
-
-- `NewCircuitBreaker(name, ...)` — *get-or-create*; se o nome já existe, **os parâmetros são ignorados** e a instância original é devolvida.
-- `GetCircuitBreaker(name)` — devolve `nil` para nome desconhecido.
-
-Extensões **opcionais** (descobertas por type assertion, sem quebrar `IManager`):
-
 ```go
+m := circuitbreaker.NewManager()
+cb := m.NewCircuitBreaker("svc", 10, 100, 60, 2) // get-or-create: nome existente IGNORA os params
+_ = m.GetCircuitBreaker("svc")                   // nil se não existir
+
 if st, ok := m.(circuitbreaker.IManagerStrict); ok {
-	cb, err := st.NewCircuitBreakerStrict("svc", 10, 100, 60, 2)
-	// err != nil se "svc" já existir com configuração DIFERENTE
-	_ = cb
+	_, err := st.NewCircuitBreakerStrict("svc", 99, 9, 9, 9) // erro: config divergente
 	_ = err
 }
 if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
-	names := lc.List() // nomes registrados
-	lc.Remove("svc")   // Stop() + desregistro
-	lc.StopAll()       // shutdown gracioso de todos
-	_ = names
+	_ = lc.List()    // nomes registrados
+	lc.Remove("svc") // Stop() + desregistro
+	lc.StopAll()     // shutdown gracioso (idempotente)
 }
 ```
+
+`IManagerLifecycle` e `IManagerStrict` são interfaces **opcionais** (type assertion) — `IManager` é contrato congelado.
 
 ## Métricas
 
-`cb.Metrics()` devolve um snapshot **imutável** (`map[host]map[endpoint]EndpointMetrics`, mais `::root` agregando cada host). Semântica dos campos:
+`cb.Metrics()` devolve um snapshot **imutável** — `map[host]map[endpoint]EndpointMetrics`, mais a chave `::root` agregando cada host. Custo interno O(1) por request (rings de 20 amostras + rodas de buckets de 1 s).
 
 | Campo (JSON) | O que mede |
 |---|---|
-| `total_requests` | Tentativas que obtiveram token (retries contam de novo) |
-| `successful_requests` | Tentativas sem erro de transporte (**inclui 4xx/5xx**) |
-| `failed_requests` | Tentativas com erro **+ cancelamentos na espera de token** (pode exceder `total_requests`) |
+| `total_requests` | Tentativas que obtiveram token (cada retry conta) |
+| `successful_requests` | Tentativas sem erro de transporte (inclui 4xx/5xx, salvo `WithStatusCodeFailure`) |
+| `failed_requests` | Tentativas com erro + cancelamentos na espera de token (**pode exceder** `total_requests`) |
 | `retry_count` | Re-tentativas agendadas |
-| `token_wait_cancellations` | Contextos cancelados/expirados esperando token (distingue cancelamento local de falha remota) |
+| `token_wait_cancellations` | Contextos cancelados/expirados esperando token (cancelamento local ≠ falha remota) |
 | `mean_requests` | Média das últimas 20 esperas por token (s) |
-| `mean_successful_requests` | Média das últimas 20 durações espera+round-trip (s) |
-| `ratio_01/05/10_*` | Contagem de eventos nos últimos 1/5/10 minutos (calculada no registro) |
+| `mean_successful_requests` / `mean_failed_requests` / `mean_retry_count` | Média das últimas 20 durações espera+round-trip (s) |
+| `ratio_01/05/10_*` | **Contagem** de eventos nos últimos 1/5/10 min (calculada no registro; "stale" até o próximo evento) |
 
-## Circuit breaker de verdade (opt-in)
+Os campos `Time*`/`StartTime*` (tag `json:"-"`) expõem as últimas ≤20 amostras.
 
-A máquina de estados *closed/open/half-open* e as demais políticas são **opt-in** via `NewCircuitBreakerWithOptions` — sem opções, o comportamento é byte a byte idêntico ao clássico (provado por teste):
+## Erros sentinela
 
-```go
-cb := circuitbreaker.NewCircuitBreakerWithOptions("minha-api", 50, 200, 30, 3,
-	// abre após 5 falhas consecutivas; fast-fail (ErrCircuitOpen) por 30s;
-	// depois 2 sondas simultâneas — sucesso fecha, falha reabre
-	circuitbreaker.WithBreaker(5, 30*time.Second, 2),
-	// 5xx conta como falha nas métricas e no breaker (resposta ainda é devolvida)
-	circuitbreaker.WithStatusCodeFailure(500),
-	// backoff exponencial 100ms→5s com jitter (default: 500ms fixo)
-	circuitbreaker.WithExponentialBackoff(100*time.Millisecond, 5*time.Second, true),
-	// teto de duração APENAS quando o chamador não definiu client Timeout nem deadline
-	circuitbreaker.WithDefaultTimeout(15*time.Second),
-)
-
-resp, err := cb.Do(req, cl)
-if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
-	// circuito aberto: acione o fallback — o downstream nem foi tocado
-}
-if sr, ok := cb.(circuitbreaker.StateReporter); ok {
-	fmt.Println("estado:", sr.State()) // closed / open / half-open / disabled
-}
-```
-
-`WithRetryPolicy(fn)` substitui a classificação de retry padrão (ex.: para retentar `ECONNREFUSED`, que o default deliberadamente não retenta). Cancelamentos locais (contexto expirado esperando token/backoff) são **neutros** para o breaker — só falhas do downstream abrem o circuito.
+| Sentinela | Quando | Como tratar |
+|---|---|---|
+| `ErrCircuitOpen` | Circuito aberto ou sondas esgotadas (só com `WithBreaker`) | fallback imediato; o downstream não foi tocado |
+| `ErrStopped` | `Do()` após `Stop()` com bucket esgotado | instância encerrada; não re-tente nela |
+| `ErrRetriesExhausted` | Todas as tentativas falharam com erro retryable | `errors.As`/`errors.Is` alcançam a última causa; `err.Error()` é estável: `"request failed after retries"` |
 
 ## Política de compatibilidade
 
-O contrato público (`ICircuitBreaker`, `IManager`, construtores, campos e tags de `EndpointMetrics`) é **congelado**: mudanças são sempre aditivas (novas funções, interfaces opcionais, campos com `omitempty`). Quebra de contrato exigirá um module path `/v2`.
+O contrato público (`ICircuitBreaker`, `IManager`, construtores, campos e tags de `EndpointMetrics`) é **congelado**: toda evolução é aditiva (funções novas, interfaces opcionais, campos `omitempty`). Quebra exigirá module path `/v2`.
 
 ## Desenvolvimento
 
 ```bash
 go vet ./...
-go test -race -count=1 ./...
-go test -bench BenchmarkDo -benchtime 2000x ./pkg/
+go test -race -count=1 ./...                          # suíte completa (~10s)
+go test -bench BenchmarkDo -benchtime 2000x ./pkg/    # ~3µs/op
 ```
 
-A suíte inclui **testes de característica** (`pkg/characterization_test.go`) que congelam a semântica observável, um **sentinela de contrato** (`pkg/contract_test.go`) que quebra a compilação se o contrato mudar, e **testes de regressão** para cada bug corrigido (`pkg/regression_test.go`). O harness de demonstração fica em `cmd/main.go` e o servidor de bancada em `internal/fakeserver.go` (porta 0 = efêmera; múltiplas instâncias simultâneas).
+Camadas da suíte (cobertura ~99%): **característica** (`characterization_test.go` — congela a semântica observável), **contrato** (`contract_test.go` — quebra a compilação se o contrato mudar), **regressão** (`regression_test.go` — um teste por bug corrigido), **funcional** (`functional_test.go`), **Fase 4** (`fase4_test.go` — inclui prova de inércia do default) e **white-box** (`whitebox_test.go` — máquina de estados e anel de buckets). Documentos de engenharia: [`CB.md`](CB.md) (arquitetura e revisão), [`CB-TESTES.md`](CB-TESTES.md) (validações empíricas), [`PLANO.md`](PLANO.md) (plano executado), [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Licença
 

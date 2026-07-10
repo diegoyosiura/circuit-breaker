@@ -1,5 +1,3 @@
-//go:build !unittest
-
 package main
 
 import (
@@ -20,13 +18,14 @@ import (
 // - Spawn multiple parallel HTTP requests (using goroutines)
 // - Measure and display total execution time and request results
 func main() {
-	// Start a local fake server on localhost:8080
-	// The FakeServer simulates processing delays and tracks statistics
+	// Start a local fake server on localhost:8080. Start() binds
+	// synchronously: when it returns nil the server is ready — no sleep.
 	fs := internal.NewFakeServer("localhost", 8080)
-	go fs.Listen()
-
-	// Allow server time to fully start before sending traffic
-	time.Sleep(5 * time.Second)
+	if err := fs.Start(); err != nil {
+		fmt.Println("não foi possível subir o FakeServer:", err)
+		return
+	}
+	defer fs.Close()
 
 	// Initialize the CircuitBreaker manager
 	m := circuitbreaker.NewManager()
@@ -51,7 +50,7 @@ func main() {
 			defer wg.Done()
 
 			// Create a new HTTP GET request to the test endpoint
-			req, _ := http.NewRequest("GET", "http://localhost:8080/teste", nil)
+			req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/teste", fs.Addr()), nil)
 			cl := &http.Client{Timeout: 10 * time.Second}
 			// Execute the request through the CircuitBreaker
 			resp, err := cb.Do(req, cl)
@@ -68,6 +67,11 @@ func main() {
 
 	// Wait for all goroutines to complete
 	wg.Wait()
+
+	// Stop the breakers registered in the manager (graceful shutdown).
+	if lc, ok := m.(circuitbreaker.IManagerLifecycle); ok {
+		lc.StopAll()
+	}
 
 	// Display the total elapsed time for all requests
 	fmt.Println("Total time:", time.Since(start))

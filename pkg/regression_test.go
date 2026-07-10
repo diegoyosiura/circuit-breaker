@@ -311,7 +311,10 @@ func TestRegression_ExtremeRateNoBusyLoop(t *testing.T) {
 	cb := circuitbreaker.NewCircuitBreaker("f5", 0, 2_000_000_000, 1, 0)
 	built := time.Since(start)
 	defer cb.Stop()
-	if built > 100*time.Millisecond {
+	// Gate generoso: o sinal do bug era ~26s; runners de CI compartilhados
+	// (2 vCPUs + instrumentação -race) levam ~200ms no pré-fill de 1e6
+	// tokens — 100ms era calibrado para máquina local e flakeava no CI.
+	if built > 3*time.Second {
 		t.Fatalf("construtor gastou %v (era ~26s no código antigo)", built)
 	}
 
@@ -333,7 +336,9 @@ func TestRegression_ExtremeRateNoBusyLoop(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &after)
 	cpu := time.Duration(after.Utime.Nano()+after.Stime.Nano()) - time.Duration(before.Utime.Nano()+before.Stime.Nano())
-	if cpu > 25*time.Millisecond { // >5% de 1 core em 500ms de ociosidade
+	// Bug original: ~500ms de CPU em 500ms (100% de 1 core). Medido pós-fix:
+	// ~3ms local; gate em 30% absorve -race + ruído de runner compartilhado.
+	if cpu > 150*time.Millisecond {
 		t.Fatalf("refiller queimando CPU ociosa: %v em 500ms", cpu)
 	}
 	t.Logf("CPU ociosa em 500ms: %v (construtor: %v)", cpu, built)

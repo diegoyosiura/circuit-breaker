@@ -1245,3 +1245,22 @@ As estatísticas do circuit-breaker estão **conformes ao modelo semântico M1-M
 - **Bucket (M11)**: burst inicial + taxa de refill bateram nas previsões teóricas exatas (cfg10: 15; cfg48: 65); clamp de 1e6 funciona (cfg44/45).
 - **Breaker (M12)**: máquina de estados completa (closed→open→half-open→closed/open), fast-fail sem tocar transport nem métricas, inércia sem WithBreaker.
 - **Lifecycle (M14)** e **concorrência (M15, M9 sob leitura concorrente)**: Stop/StopAll idempotentes, manager thread-safe, snapshots de métricas sem aliasing — zero races em todas as execuções.
+
+---
+
+## 15. Caça a falhas no código refatorado (pós-implementação)
+
+> Workflow multiagente (6 caçadores com lentes distintas + verificação adversarial com repro obrigatório para crítico/alto — 33 agentes) sobre o código NOVO da branch, explicitamente instruído a achar o que as validações anteriores (suíte, 24 itens de não-regressão, 50 configs) deixaram passar. **Resultado: 24 achados CONFIRMADOS (≈13 causas-raiz após dedup), 3 refutados, 0 plausíveis — todos os defeitos corrigidos no commit `5fffd9b` com 11 testes de regressão (`TestHunt_*`).**
+
+**Causas-raiz corrigidas (destaques):**
+
+1. **`WithDefaultTimeout` matava a leitura do Body** *(4 lentes acharam independentemente — SM-2/API-01/DO-INT-1/OPT-01)*: o `defer cancel()` rodava no retorno de `Do()`, abortando a conexão antes de o chamador ler a resposta; corpos maiores que o buffer do transporte falhavam com `context canceled` (repro: 3.959 de 1.048.576 bytes lidos). As validações anteriores não pegaram porque usavam corpos minúsculos já bufferizados. **Fix:** cancel amarrado ao `Close()` do Body.
+2. **Sondas vazavam entre gerações de half-open** *(SM-1, repro determinístico 3/3)*: sonda antiga terminando neutra decrementava o contador da geração nova → `probes` negativo → até `maxProbes+N` sondas simultâneas contra o downstream em recuperação. **Fix:** contador de geração; reports de gerações passadas são no-op. De quebra, sondas penduradas para sempre não travam mais o breaker (**wedge** API-02: a geração expira após um `openFor` extra).
+3. **Cancelamento do chamador em voo abria o circuito** *(TB-01/SM-3/DO-INT-3)*: `url.Error{Canceled}` era classificado como falha — rajada de cancelamentos locais abria o circuito sem o downstream ter falhado. **Fix:** `Canceled` é neutro em qualquer ponto da cadeia. Simetricamente, **deadline que estoura no backoff após falhas reais nunca abria o circuito** *(DO-INT-2)* — com `WithDefaultTimeout`, um downstream morto jamais abriria; agora escala para falha.
+4. **Panic no transporte era reportado como SUCESSO** *(API-04/SM-5)*: o defer lia `finalResp/finalErr` zerados; um panic em half-open FECHAVA o circuito. **Fix:** `recover` → conta falha → re-panic.
+5. **Roda de buckets descartava eventos concorrentes** *(MW-1)*: evento com início 1s no passado (corrida natural entre goroutines) era ignorado → ratios subcontavam sistematicamente sob concorrência. **Fix:** buckets do passado recente (< 600 s) ainda aceitam registro.
+6. **Cardinalidade ilimitada de endpoints** *(API-03)*: ~13,7 KB retidos por path único (REST com IDs → leak). **Fix:** teto de ~1k endpoints/host com agregação em `::other` (também mitiga API-06). Mais: `Do(nil)` retornava panic (API-05), `Option` nil panicava e vazava goroutine (OPT-02), overflow do shift no backoff exponencial (OPT-03), contexto morto queimava token do bucket (TB-02), path literal `::root` aliasava o agregado (MW-2), erro de `GetBody` quebrava a invariante `total==ok+fail` (DO-INT-4).
+
+**Documentados como deliberados (não corrigidos):** admissão decidida na entrada de `Do` (SM-4 — fila em voo drena, padrão canônico), `WithBreaker(0,0,0)` sanitizado para os mínimos (API-07), custo O(endpoints) do snapshot de `Metrics()` (API-06, mitigado pelo cap). **Refutados (3):** invisibilidade do fast-fail nas métricas (2 lentes) e descarte de falha pós-Stop — comportamentos documentados, não defeitos.
+
+**Lição de processo:** três rodadas de validação (suíte verde, não-regressão 24/24, 50 configs conformes) não substituem caça adversarial dedicada — os 4 relatórios independentes do mesmo bug do `WithDefaultTimeout` mostram que lentes distintas convergindo é sinal forte, e o bug só aparecia com corpos grandes, exatamente o que nenhuma validação anterior exercitava.

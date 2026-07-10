@@ -98,6 +98,19 @@ default) e 5.
   CPU ociosa em config degenerada de ~4% para **0,55%** de um core;
   construtor ~13ms. *Bucket lazy avaliado e adiado (condição do plano).*
 
+### Caça a falhas pós-implementação (hunt)
+
+- Workflow multiagente (6 lentes + verificação adversarial) sobre o código
+  novo: 24 achados confirmados (~13 causas-raiz), todos corrigidos com 11
+  regressões `TestHunt_*`. Destaques: `WithDefaultTimeout` não mata mais a
+  leitura do Body (cancel amarrado ao Close); gerações de half-open (sondas
+  antigas não corrompem `probes`/estado; wedge de sondas penduradas expira);
+  `context.Canceled` em voo é neutro e deadline-após-falhas-reais abre o
+  circuito; panic no transporte conta como falha e propaga; roda de buckets
+  aceita eventos concorrentes do passado recente; cardinalidade de endpoints
+  limitada (~1k/host, overflow em `::other`); `Do(nil)`/`Option` nil sem
+  panic; contexto morto não queima token. Detalhes: CB-TESTES.md §15.
+
 ### Infra
 
 - FakeServer (`internal/`): porta 0 = efêmera (N servidores simultâneos),

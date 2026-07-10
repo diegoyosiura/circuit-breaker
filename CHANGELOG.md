@@ -6,7 +6,50 @@ Todas as mudanças notáveis do `circuit-breaker`. O contrato público
 Mudanças de comportamento observável estão marcadas com ⚖️ e correspondem às
 decisões D1–D5 do [`PLANO.md`](PLANO.md).
 
-## [não publicado] — branch `refactor/optimizations` (2026-07-09)
+## [v1.1.0] — 2026-07-10 (PR #7, branch `feat/anti-block-toolkit`)
+
+Kit anti-bloqueio para APIs externas com limites rígidos (caso CCEE/Omie).
+Tudo aditivo; sem opções novas, comportamento byte a byte inalterado.
+
+### Adicionado
+
+- **`WithBurst(n)`**: desacopla a rajada (capacidade do bucket) da taxa de
+  reposição. Regra para limite rígido L/janela: `maxRequests + burst <= L` —
+  com `WithBurst(1)` usa-se ~99% do orçamento sem exceder em nenhuma janela
+  deslizante (antes: rajada fixa = maxRequests → ~2× o limite na 1ª janela).
+  Exigiu adiar a inicialização do bucket para depois das options
+  (`initTokenBucket` pós-`NewCircuitBreakerWithOptions`).
+- **`WithRetryAfter(maxWait)`**: honra `Retry-After` (segundos ou HTTP-date)
+  de respostas 429/503 — gate GLOBAL do breaker (uma resposta de bloqueio
+  pausa todas as chamadas, novas e retries) + retry da própria chamada após
+  o prazo (cap em maxWait; corpo rebobinável exigido; espera respeita ctx;
+  body drenado/fechado antes do retry).
+- **`BreakerSpec` + `ConfigureManager`**: configuração declarativa por API
+  num único lugar — validação tudo-ou-nada contra o registro do manager,
+  idempotente, com Options aplicadas na criação.
+- README: seção "Receita anti-bloqueio" com o freio de emergência completo
+  e as duas métricas de operação (`token_wait_cancellations`,
+  `ratio_01_failed`); teste de integração da receita
+  (TestRecipe_EmergencyBrakeAndGoldenMetrics).
+
+### Corrigido (caça focada no kit — 10 achados confirmados, 0 refutados)
+
+- `parseRetryAfter` satura em vez de estourar int64: header hostil gigante
+  ("10000000000") gerava delay NEGATIVO que desarmava o gate e disparava
+  retries imediatos — a proteção falhava aberta sob o sinal de bloqueio.
+- `waitRetryAfterGate` re-checa o gate em loop: extensão por resposta 429
+  em voo durante o sono era ignorada e chamadas atravessavam a pausa.
+- `Stop()` desbloqueia chamadas presas no gate (via tokenStop), com
+  contabilidade de ErrStopped espelhando o caminho do token.
+- Piso de backoff no retry pós-429: `Retry-After: 0`/data no passado não
+  vira martelada imediata.
+- `ConfigureManager` rejeita spec com rate limit incompleto (MaxRequests
+  sem WindowSeconds ou vice-versa) na fase de validação (tudo-ou-nada).
+- Docs: TokenWaitCancellations cobre a espera do gate; notas operacionais
+  do ConfigureManager (instâncias paradas; custo sob lock). 5 regressões
+  novas (TestHuntAB_*).
+
+## [v1.0.0] — 2026-07-10 (PR #6, branch `refactor/optimizations`)
 
 Execução integral do PLANO.md — Fases 0, 1, 2, 3, 4 (opt-in, inerte por
 default) e 5.
@@ -120,49 +163,6 @@ default) e 5.
   dessincronização, `-race -count=1`, `codecov-action@v4` [A18].
 - `pkg/manger.go` → `pkg/manager.go`; build tag inerte removida de
   `cmd/main.go`; README reescrito com exemplo compilável [A17/A19].
-
-## [não publicado 2] — branch `feat/anti-block-toolkit` (2026-07-10)
-
-Kit anti-bloqueio para APIs externas com limites rígidos (caso CCEE/Omie).
-Tudo aditivo; sem opções novas, comportamento byte a byte inalterado.
-
-### Adicionado
-
-- **`WithBurst(n)`**: desacopla a rajada (capacidade do bucket) da taxa de
-  reposição. Regra para limite rígido L/janela: `maxRequests + burst <= L` —
-  com `WithBurst(1)` usa-se ~99% do orçamento sem exceder em nenhuma janela
-  deslizante (antes: rajada fixa = maxRequests → ~2× o limite na 1ª janela).
-  Exigiu adiar a inicialização do bucket para depois das options
-  (`initTokenBucket` pós-`NewCircuitBreakerWithOptions`).
-- **`WithRetryAfter(maxWait)`**: honra `Retry-After` (segundos ou HTTP-date)
-  de respostas 429/503 — gate GLOBAL do breaker (uma resposta de bloqueio
-  pausa todas as chamadas, novas e retries) + retry da própria chamada após
-  o prazo (cap em maxWait; corpo rebobinável exigido; espera respeita ctx;
-  body drenado/fechado antes do retry).
-- **`BreakerSpec` + `ConfigureManager`**: configuração declarativa por API
-  num único lugar — validação tudo-ou-nada contra o registro do manager,
-  idempotente, com Options aplicadas na criação.
-- README: seção "Receita anti-bloqueio" com o freio de emergência completo
-  e as duas métricas de operação (`token_wait_cancellations`,
-  `ratio_01_failed`); teste de integração da receita
-  (TestRecipe_EmergencyBrakeAndGoldenMetrics).
-
-### Corrigido (caça focada no kit — 10 achados confirmados, 0 refutados)
-
-- `parseRetryAfter` satura em vez de estourar int64: header hostil gigante
-  ("10000000000") gerava delay NEGATIVO que desarmava o gate e disparava
-  retries imediatos — a proteção falhava aberta sob o sinal de bloqueio.
-- `waitRetryAfterGate` re-checa o gate em loop: extensão por resposta 429
-  em voo durante o sono era ignorada e chamadas atravessavam a pausa.
-- `Stop()` desbloqueia chamadas presas no gate (via tokenStop), com
-  contabilidade de ErrStopped espelhando o caminho do token.
-- Piso de backoff no retry pós-429: `Retry-After: 0`/data no passado não
-  vira martelada imediata.
-- `ConfigureManager` rejeita spec com rate limit incompleto (MaxRequests
-  sem WindowSeconds ou vice-versa) na fase de validação (tudo-ou-nada).
-- Docs: TokenWaitCancellations cobre a espera do gate; notas operacionais
-  do ConfigureManager (instâncias paradas; custo sob lock). 5 regressões
-  novas (TestHuntAB_*).
 
 ## [v0.0.7] — baseline da revisão
 

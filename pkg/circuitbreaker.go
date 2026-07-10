@@ -7,7 +7,10 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +49,13 @@ type circuitBreaker struct {
 	expBackoff     *expBackoffConfig // backoff exponencial (WithExponentialBackoff)
 	defaultTimeout time.Duration     // teto quando o chamador não define nenhum (WithDefaultTimeout)
 
+	// Anti-bloqueio (opt-in; zero = inerte)
+	maxRequests     int           // guardado para initTokenBucket (pós-options)
+	windowSeconds   int           // idem
+	burst           int           // capacidade do bucket desacoplada da taxa (WithBurst)
+	retryAfterMax   time.Duration // teto de espera do Retry-After (WithRetryAfter; 0 = off)
+	retryAfterUntil atomic.Int64  // gate global (unixnano): 429/503 pausa TODO o breaker
+
 	tokenWaitGroup sync.WaitGroup // WaitGroup to ensure graceful token goroutine shutdown
 	stopOnce       sync.Once      // Ensures Stop() only closes the channel once
 
@@ -60,7 +70,9 @@ type circuitBreaker struct {
 // - windowSeconds: Duration of the rate-limiting window
 // - maxRetries: Max number of retry attempts on failure
 func NewCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSeconds int, maxRetries int) ICircuitBreaker {
-	return newCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
+	cb := newCircuitBreaker(name, maxConcurrent, maxRequests, windowSeconds, maxRetries)
+	cb.initTokenBucket()
+	return cb
 }
 
 // newCircuitBreaker é o núcleo concreto compartilhado por NewCircuitBreaker
@@ -77,45 +89,60 @@ func newCircuitBreaker(name string, maxConcurrent, maxRequests int, windowSecond
 		cb.sem = make(chan struct{}, maxConcurrent)
 	}
 
-	if maxRequests > 0 && windowSeconds > 0 {
-		// Teto de capacidade para configs degeneradas: sem ele, maxRequests
-		// gigante custa dezenas de segundos de pré-fill no construtor e anula
-		// o rate limit na prática (CB.md A16). Configs sãs não são afetadas.
-		capacity := maxRequests
-		if capacity > maxBucketCapacity {
-			capacity = maxBucketCapacity
-		}
-		cb.tokens = make(chan struct{}, capacity)
-
-		interval := (time.Duration(windowSeconds) * time.Second) / time.Duration(maxRequests)
-		cb.tokensPerTick = 1
-		if interval < minTokenInterval {
-			// Tick engrossado (25ms) com reposição em lote: preserva a taxa
-			// nominal (erro de arredondamento <4% acima de 1000 req/s) e
-			// reduz as acordadas do refiller de 1000/s para 40/s — o resíduo
-			// de ~4% de CPU apontado na validação de não-regressão cai para
-			// ~0 (CB.md A16; configs com intervalo >= 1ms não são afetadas).
-			perSecond := float64(maxRequests) / float64(windowSeconds)
-			cb.tokensPerTick = int(math.Round(perSecond * clampedTick.Seconds()))
-			if cb.tokensPerTick < 1 {
-				cb.tokensPerTick = 1
-			}
-			if cb.tokensPerTick > capacity {
-				cb.tokensPerTick = capacity // nunca repõe mais que o bucket comporta
-			}
-			interval = clampedTick
-		}
-		cb.tokenInterval = interval
-		cb.tokenStop = make(chan struct{})
-
-		for i := 0; i < cap(cb.tokens); i++ {
-			cb.tokens <- struct{}{}
-		}
-
-		cb.startTokenBucket()
-	}
+	cb.maxRequests = maxRequests
+	cb.windowSeconds = windowSeconds
 
 	return cb
+}
+
+// initTokenBucket cria e liga o token bucket. É chamado pelos construtores
+// públicos DEPOIS de as options serem aplicadas — WithBurst precisa alterar a
+// capacidade antes do pré-fill e do início do refiller.
+func (cb *circuitBreaker) initTokenBucket() {
+	maxRequests, windowSeconds := cb.maxRequests, cb.windowSeconds
+	if maxRequests <= 0 || windowSeconds <= 0 {
+		return
+	}
+
+	// Capacidade = burst. Default: maxRequests (comportamento histórico);
+	// WithBurst desacopla — burst pequeno permite usar ~todo o orçamento de
+	// APIs com limite rígido (regra: maxRequests + burst <= limite/janela).
+	// Teto para configs degeneradas: sem ele, capacidade gigante custa
+	// dezenas de segundos de pré-fill e anula o rate limit (CB.md A16).
+	capacity := maxRequests
+	if cb.burst > 0 {
+		capacity = cb.burst
+	}
+	if capacity > maxBucketCapacity {
+		capacity = maxBucketCapacity
+	}
+	cb.tokens = make(chan struct{}, capacity)
+
+	interval := (time.Duration(windowSeconds) * time.Second) / time.Duration(maxRequests)
+	cb.tokensPerTick = 1
+	if interval < minTokenInterval {
+		// Tick engrossado (25ms) com reposição em lote: preserva a taxa
+		// nominal (erro de arredondamento <4% acima de 1000 req/s) e
+		// reduz as acordadas do refiller de 1000/s para 40/s (CB.md A16;
+		// configs com intervalo >= 1ms não são afetadas).
+		perSecond := float64(maxRequests) / float64(windowSeconds)
+		cb.tokensPerTick = int(math.Round(perSecond * clampedTick.Seconds()))
+		if cb.tokensPerTick < 1 {
+			cb.tokensPerTick = 1
+		}
+		if cb.tokensPerTick > capacity {
+			cb.tokensPerTick = capacity // nunca repõe mais que o bucket comporta
+		}
+		interval = clampedTick
+	}
+	cb.tokenInterval = interval
+	cb.tokenStop = make(chan struct{})
+
+	for i := 0; i < cap(cb.tokens); i++ {
+		cb.tokens <- struct{}{}
+	}
+
+	cb.startTokenBucket()
 }
 
 // startTokenBucket starts a background goroutine that generates tokens at regular intervals
@@ -251,6 +278,13 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 
 	for attempt := 0; attempt <= cb.MaxRetries; attempt++ {
 		start := time.Now()
+		// WithRetryAfter: se a API pediu pausa (gate global), espera aqui —
+		// vale para chamadas novas e para retries.
+		if err := cb.waitRetryAfterGate(req.Context()); err != nil {
+			cb.recordFailure(host, endpoint, start, time.Now())
+			cb.recordTokenCancel(host, endpoint)
+			return nil, err
+		}
 		if err := cb.waitForToken(req.Context()); err != nil {
 			// Semântica original preservada (D3): o cancelamento conta como
 			// falha SEM tentativa (failed pode exceder total). O contador
@@ -288,6 +322,30 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 				cb.recordFailure(host, endpoint, start, time.Now())
 			} else {
 				cb.recordSuccess(host, endpoint, start, time.Now())
+			}
+
+			// WithRetryAfter: 429/503 com header estende o gate global e,
+			// havendo tentativas restantes e corpo rebobinável, aguarda o
+			// que a API pediu (limitado a retryAfterMax) e re-tenta.
+			if cb.retryAfterMax > 0 && retryAfterStatus(resp.StatusCode) {
+				if delay, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+					if delay > cb.retryAfterMax {
+						delay = cb.retryAfterMax
+					}
+					until := time.Now().Add(delay)
+					cb.extendRetryAfterGate(until)
+
+					if attempt < cb.MaxRetries && (req.Body == nil || req.GetBody != nil) {
+						drainAndClose(resp)
+						cb.recordRetry(host, endpoint, start, time.Now())
+						select {
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						case <-time.After(time.Until(until)):
+						}
+						continue
+					}
+				}
 			}
 			return resp, nil // Success (transport-level)
 		}
@@ -327,6 +385,74 @@ func (cb *circuitBreaker) Do(req *http.Request, cl *http.Client) (finalResp *htt
 	// All retry attempts failed. The text is frozen (informal contract);
 	// the last cause is recoverable via errors.Is/As (F7).
 	return nil, &retriesExhaustedError{last: lastErr}
+}
+
+// retryAfterStatus indica os códigos que carregam Retry-After por convenção.
+func retryAfterStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable
+}
+
+// parseRetryAfter aceita os dois formatos do header (segundos ou HTTP-date).
+func parseRetryAfter(h string, now time.Time) (time.Duration, bool) {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(h); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+// extendRetryAfterGate estende o gate GLOBAL do breaker: uma resposta de
+// bloqueio (429/503 + Retry-After) pausa TODAS as chamadas até `until` —
+// continuar batendo numa API que pediu pausa é o caminho mais curto para o
+// bloqueio de conta.
+func (cb *circuitBreaker) extendRetryAfterGate(until time.Time) {
+	n := until.UnixNano()
+	for {
+		cur := cb.retryAfterUntil.Load()
+		if cur >= n || cb.retryAfterUntil.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// waitRetryAfterGate bloqueia (respeitando ctx) enquanto o gate estiver ativo.
+func (cb *circuitBreaker) waitRetryAfterGate(ctx context.Context) error {
+	if cb.retryAfterMax <= 0 {
+		return nil
+	}
+	d := time.Until(time.Unix(0, cb.retryAfterUntil.Load()))
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// drainAndClose consome (limitado) e fecha o corpo antes de um retry —
+// obrigatório para reutilizar a conexão e não vazar o body.
+func drainAndClose(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
 }
 
 // cancelOnClose amarra o cancel do contexto de WithDefaultTimeout ao Close()

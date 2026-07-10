@@ -191,6 +191,8 @@ Propriedades: a espera por token respeita o contexto; após `Stop()`, sobras do 
 | `WithRetryPolicy(fn)` | Classificação de retry customizada | só `net.Error` com `Timeout()`/`Temporary()` |
 | `WithExponentialBackoff(base, max, jitter)` | Espera `min(max, base·2ⁿ)`, jitter em `[d/2, d)` | 500 ms fixo |
 | `WithDefaultTimeout(d)` | Teto de duração **apenas** quando `cl.Timeout == 0` **e** o request não tem deadline | sem teto (pode esperar para sempre) |
+| `WithBurst(n)` | Capacidade do bucket (rajada) desacoplada da taxa — essencial para limites rígidos de API | rajada = `maxRequests` (~2× o limite na 1ª janela!) |
+| `WithRetryAfter(maxWait)` | Honra `Retry-After` de 429/503: **gate global** pausa o breaker inteiro + retry da própria chamada após o prazo (cap em `maxWait`) | 429/503 devolvidos direto, sem pausa |
 
 ### Semântica efetiva de retry (default)
 
@@ -201,6 +203,46 @@ Propriedades: a espera por token respeita o contexto; após `Stop()`, sobras do 
 | Erro retryable embrulhado com `fmt.Errorf("%w", ...)` dentro do transport | ❌ (`url.Error` sonda por type-assertion direta) |
 | Erro genérico | ❌ |
 | Corpo não-rebobinável (`GetBody == nil`) após falha retryable | ❌ devolve o erro da tentativa |
+
+## Receita anti-bloqueio (limites rígidos de APIs externas)
+
+Para APIs que **bloqueiam** quem excede o limite (ex.: 200 req/min, ou "sem chamadas simultâneas"), configure tudo num único lugar com `ConfigureManager`:
+
+```go
+specs := map[string]circuitbreaker.BreakerSpec{
+	// Limite rígido de 200 req/min. REGRA: maxRequests + burst <= limite.
+	// (Sem WithBurst, a rajada = maxRequests e a 1ª janela pós-ociosa
+	// chega a ~2× o limite → bloqueio.)
+	"ccee": {MaxRequests: 199, WindowSeconds: 60, MaxRetries: 2,
+		Options: []circuitbreaker.Option{
+			circuitbreaker.WithBurst(1),                    // 1+199 = 200 ✓ em QUALQUER janela
+			circuitbreaker.WithRetryAfter(2 * time.Minute), // API pediu pausa? TODOS pausam
+			circuitbreaker.WithStatusCodeFailure(429),      // 429 = falha
+			circuitbreaker.WithBreaker(3, time.Minute, 1),  // freio: 3 seguidas → para tudo
+		}},
+
+	// Sem requisições simultâneas: semáforo de 1.
+	"omie": {MaxConcurrent: 1, MaxRetries: 2},
+}
+
+breakers, err := circuitbreaker.ConfigureManager(m, specs) // tudo-ou-nada; idempotente
+```
+
+**As duas métricas de ouro** para operar isso:
+
+```go
+for host, eps := range breakers["ccee"].Metrics() {
+	root := eps["::root"]
+	// 1) Saturação do SEU orçamento (aja ANTES de a API reclamar):
+	//    cancelamentos esperando token subindo = chamadas morrendo na fila.
+	_ = root.TokenWaitCancellations
+	// 2) A API começou a recusar (alerta imediato):
+	_ = root.Ratio01FailedRequests // falhas no último minuto (com 429=falha)
+	_ = host
+}
+```
+
+**Atenção — orçamento é por processo:** com N réplicas do serviço, divida `maxRequests` por N ou centralize as chamadas dessa API em uma instância.
 
 ## Manager
 

@@ -121,6 +121,32 @@ default) e 5.
 - `pkg/manger.go` → `pkg/manager.go`; build tag inerte removida de
   `cmd/main.go`; README reescrito com exemplo compilável [A17/A19].
 
+## [não publicado 2] — branch `feat/anti-block-toolkit` (2026-07-10)
+
+Kit anti-bloqueio para APIs externas com limites rígidos (caso CCEE/Omie).
+Tudo aditivo; sem opções novas, comportamento byte a byte inalterado.
+
+### Adicionado
+
+- **`WithBurst(n)`**: desacopla a rajada (capacidade do bucket) da taxa de
+  reposição. Regra para limite rígido L/janela: `maxRequests + burst <= L` —
+  com `WithBurst(1)` usa-se ~99% do orçamento sem exceder em nenhuma janela
+  deslizante (antes: rajada fixa = maxRequests → ~2× o limite na 1ª janela).
+  Exigiu adiar a inicialização do bucket para depois das options
+  (`initTokenBucket` pós-`NewCircuitBreakerWithOptions`).
+- **`WithRetryAfter(maxWait)`**: honra `Retry-After` (segundos ou HTTP-date)
+  de respostas 429/503 — gate GLOBAL do breaker (uma resposta de bloqueio
+  pausa todas as chamadas, novas e retries) + retry da própria chamada após
+  o prazo (cap em maxWait; corpo rebobinável exigido; espera respeita ctx;
+  body drenado/fechado antes do retry).
+- **`BreakerSpec` + `ConfigureManager`**: configuração declarativa por API
+  num único lugar — validação tudo-ou-nada contra o registro do manager,
+  idempotente, com Options aplicadas na criação.
+- README: seção "Receita anti-bloqueio" com o freio de emergência completo
+  e as duas métricas de operação (`token_wait_cancellations`,
+  `ratio_01_failed`); teste de integração da receita
+  (TestRecipe_EmergencyBrakeAndGoldenMetrics).
+
 ## [v0.0.7] — baseline da revisão
 
 Estado auditado em [`CB.md`](CB.md) e validado empiricamente em

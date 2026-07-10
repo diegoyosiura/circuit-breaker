@@ -77,6 +77,45 @@ func WithExponentialBackoff(base, max time.Duration, jitter bool) Option {
 	}
 }
 
+// WithBurst desacopla a CAPACIDADE do bucket (rajada) da TAXA de reposição.
+// Sem esta opção, capacidade = maxRequests: após qualquer período ocioso, a
+// primeira janela passa até ~2x maxRequests — o que VIOLA limites rígidos de
+// APIs externas ("200 req/min" da CCEE vira ~400 no pior caso). Regra segura
+// para limite rígido L por janela W: maxRequests + burst <= L, com
+// windowSeconds = W. Ex.: L=200/min → (maxRequests=199, windowSeconds=60,
+// WithBurst(1)) usa ~99,5% do orçamento sem jamais exceder em NENHUMA janela
+// deslizante. Valores <= 0 viram 1 (taxa pura, sem rajada).
+//
+// Nota para taxas > 1000 req/s (tick engrossado de 25ms): a taxa sustentada
+// fica limitada a burst/25ms; use burst >= taxa*0,025 nesses casos.
+func WithBurst(n int) Option {
+	return func(cb *circuitBreaker) {
+		if n < 1 {
+			n = 1
+		}
+		cb.burst = n
+	}
+}
+
+// WithRetryAfter honra o header Retry-After de respostas 429/503:
+//   - estende um gate GLOBAL do breaker — todas as chamadas (novas e retries)
+//     aguardam o prazo pedido pela API antes de voltar a bater;
+//   - a própria chamada re-tenta após o prazo, se restarem tentativas e o
+//     corpo for rebobinável; senão, a resposta 429/503 é devolvida ao chamador
+//     (com o gate já armado para as próximas).
+//
+// maxWait limita a espera (headers de minutos/horas não penduram chamadas);
+// <= 0 vira 5 minutos. A espera respeita o contexto do request. Combine com
+// WithStatusCodeFailure(429)+WithBreaker para o freio de emergência completo.
+func WithRetryAfter(maxWait time.Duration) Option {
+	return func(cb *circuitBreaker) {
+		if maxWait <= 0 {
+			maxWait = 5 * time.Minute
+		}
+		cb.retryAfterMax = maxWait
+	}
+}
+
 // WithDefaultTimeout aplica um teto de duração APENAS quando o chamador não
 // definiu nenhum: se cl.Timeout == 0 E o request não tem deadline, o contexto
 // é envolvido com context.WithTimeout(d). Chamadas com client/deadline
@@ -104,6 +143,7 @@ func NewCircuitBreakerWithOptions(
 			opt(cb)
 		}
 	}
+	cb.initTokenBucket() // pós-options: WithBurst altera a capacidade
 	return cb
 }
 
